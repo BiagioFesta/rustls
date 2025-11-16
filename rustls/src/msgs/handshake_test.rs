@@ -1,9 +1,10 @@
+use core::time::Duration;
 use std::prelude::v1::*;
 use std::{format, println, vec};
 
 use pki_types::{CertificateDer, DnsName};
 
-use super::base::{Payload, PayloadU8, PayloadU16, PayloadU24};
+use super::base::{PayloadU8, PayloadU16, PayloadU24};
 use super::codec::{Codec, Reader, put_u16};
 use super::enums::{
     ClientCertificateType, Compression, ECCurveType, EchVersion, ExtensionType, HpkeAead, HpkeKdf,
@@ -23,6 +24,7 @@ use super::handshake::{
     ServerKeyExchangeParams, ServerKeyExchangePayload, ServerNamePayload, SessionId,
     SingleProtocolName, SupportedEcPointFormats, SupportedProtocolVersions,
 };
+use crate::crypto::cipher::Payload;
 use crate::enums::{
     CertificateCompressionAlgorithm, CertificateType, CipherSuite, HandshakeType, ProtocolVersion,
     SignatureScheme,
@@ -136,7 +138,7 @@ fn refuses_server_ext_with_unparsed_bytes() {
 #[test]
 fn refuses_certificate_ext_with_unparsed_bytes() {
     let bytes = [
-        0x00u8, 0x09, 0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x00u8, 0x0a, 0x00, 0x05, 0x00, 0x06, 0x01, 0x00, 0x00, 0x01, 0xcc, 0x01,
     ];
     assert_eq!(
         CertificateExtensions::read_bytes(&bytes).unwrap_err(),
@@ -1060,7 +1062,7 @@ fn sample_certificate_payload_tls13() -> CertificatePayloadTls13<'static> {
             cert: CertificateDer::from(vec![3, 4, 5]),
             extensions: CertificateExtensions {
                 status: Some(CertificateStatus {
-                    ocsp_response: PayloadU24(Payload::new(vec![1, 2, 3])),
+                    ocsp_response: PayloadU24::from(Payload::new(vec![1, 2, 3])),
                 }),
             },
         }],
@@ -1071,7 +1073,7 @@ fn sample_compressed_certificate() -> CompressedCertificatePayload<'static> {
     CompressedCertificatePayload {
         alg: CertificateCompressionAlgorithm::Brotli,
         uncompressed_len: 123,
-        compressed: PayloadU24(Payload::new(vec![1, 2, 3])),
+        compressed: PayloadU24::from(Payload::new(vec![1, 2, 3])),
     }
 }
 
@@ -1093,7 +1095,7 @@ fn sample_dhe_server_key_exchange_payload() -> ServerKeyExchangePayload {
         params: ServerKeyExchangeParams::Dh(ServerDhParams {
             dh_p: PayloadU16::new(vec![1, 2, 3]),
             dh_g: PayloadU16::new(vec![2]),
-            dh_Ys: PayloadU16::new(vec![1, 2]),
+            dh_ys: PayloadU16::new(vec![1, 2]),
         }),
         dss: DigitallySignedStruct::new(SignatureScheme::RSA_PSS_SHA256, vec![1, 2, 3]),
     })
@@ -1124,14 +1126,14 @@ fn sample_certificate_request_payload_tls13() -> CertificateRequestPayloadTls13 
 
 fn sample_new_session_ticket_payload() -> NewSessionTicketPayload {
     NewSessionTicketPayload {
-        lifetime_hint: 1234,
+        lifetime_hint: Duration::from_secs(1234),
         ticket: Arc::new(PayloadU16::new(vec![1, 2, 3])),
     }
 }
 
 fn sample_new_session_ticket_payload_tls13() -> NewSessionTicketPayloadTls13 {
     NewSessionTicketPayloadTls13 {
-        lifetime: 123,
+        lifetime: Duration::from_secs(123),
         age_add: 1234,
         nonce: PayloadU8::new(vec![1, 2, 3]),
         ticket: Arc::new(PayloadU16::new(vec![4, 5, 6])),
@@ -1147,7 +1149,7 @@ fn sample_encrypted_extensions() -> Box<ServerExtensions<'static>> {
 
 fn sample_certificate_status() -> CertificateStatus<'static> {
     CertificateStatus {
-        ocsp_response: PayloadU24(Payload::new(vec![1, 2, 3])),
+        ocsp_response: PayloadU24::from(Payload::new(vec![1, 2, 3])),
     }
 }
 

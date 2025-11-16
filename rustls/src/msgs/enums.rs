@@ -1,55 +1,13 @@
 #![allow(clippy::upper_case_acronyms)]
 #![allow(non_camel_case_types)]
-use crate::crypto::{KeyExchangeAlgorithm, hash};
+use crate::crypto::KeyExchangeAlgorithm;
 use crate::enums::ProtocolVersion;
 use crate::msgs::codec::{Codec, Reader};
 
 enum_builder! {
-    /// The `HashAlgorithm` TLS protocol enum.  Values in this enum are taken
-    /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognised ordinals.
-    #[repr(u8)]
-    pub enum HashAlgorithm {
-        NONE => 0x00,
-        MD5 => 0x01,
-        SHA1 => 0x02,
-        SHA224 => 0x03,
-        SHA256 => 0x04,
-        SHA384 => 0x05,
-        SHA512 => 0x06,
-    }
-}
-
-impl HashAlgorithm {
-    /// Returns the hash of the empty input.
-    ///
-    /// This returns `None` for some hash algorithms, so the caller
-    /// should be prepared to do the computation themselves in this case.
-    pub(crate) fn hash_for_empty_input(&self) -> Option<hash::Output> {
-        match self {
-            Self::SHA256 => Some(hash::Output::new(
-                b"\xe3\xb0\xc4\x42\x98\xfc\x1c\x14\
-                  \x9a\xfb\xf4\xc8\x99\x6f\xb9\x24\
-                  \x27\xae\x41\xe4\x64\x9b\x93\x4c\
-                  \xa4\x95\x99\x1b\x78\x52\xb8\x55",
-            )),
-            Self::SHA384 => Some(hash::Output::new(
-                b"\x38\xb0\x60\xa7\x51\xac\x96\x38\
-                  \x4c\xd9\x32\x7e\xb1\xb1\xe3\x6a\
-                  \x21\xfd\xb7\x11\x14\xbe\x07\x43\
-                  \x4c\x0c\xc7\xbf\x63\xf6\xe1\xda\
-                  \x27\x4e\xde\xbf\xe7\x6f\x65\xfb\
-                  \xd5\x1a\xd2\xf1\x48\x98\xb9\x5b",
-            )),
-            _ => None,
-        }
-    }
-}
-
-enum_builder! {
     /// The `ClientCertificateType` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognised ordinals.
+    /// The `Unknown` item is used when processing unrecognized ordinals.
     #[repr(u8)]
     pub(crate) enum ClientCertificateType {
         RSASign => 0x01,
@@ -68,7 +26,7 @@ enum_builder! {
 enum_builder! {
     /// The `Compression` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognised ordinals.
+    /// The `Unknown` item is used when processing unrecognized ordinals.
     #[repr(u8)]
     pub enum Compression {
         Null => 0x00,
@@ -80,7 +38,7 @@ enum_builder! {
 enum_builder! {
     /// The `AlertLevel` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognised ordinals.
+    /// The `Unknown` item is used when processing unrecognized ordinals.
     #[repr(u8)]
     pub enum AlertLevel {
         Warning => 0x01,
@@ -91,7 +49,7 @@ enum_builder! {
 enum_builder! {
     /// The `HeartbeatMessageType` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognised ordinals.
+    /// The `Unknown` item is used when processing unrecognized ordinals.
     #[repr(u8)]
     pub(crate) enum HeartbeatMessageType {
         Request => 0x01,
@@ -102,7 +60,7 @@ enum_builder! {
 enum_builder! {
     /// The `ExtensionType` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognised ordinals.
+    /// The `Unknown` item is used when processing unrecognized ordinals.
     #[repr(u16)]
     pub enum ExtensionType {
         ServerName => 0x0000,
@@ -157,8 +115,8 @@ impl ExtensionType {
     /// sometimes (e.g. server name, cert compression methods), but not always, SHOULD NOT be
     /// compressed.
     ///
-    /// See [draft-ietf-esni-18 §5](https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-18#section-5)
-    /// and [draft-ietf-esni-18 §10.5](https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-18#section-10.5)
+    /// See [draft-ietf-tls-esni-18 §5](https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-18#section-5)
+    /// and [draft-ietf-tls-esni-18 §10.5](https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-18#section-10.5)
     /// for more information.
     pub(crate) fn ech_compress(&self) -> bool {
         // We match which extensions we will compress with BoringSSL and Go's stdlib.
@@ -180,7 +138,7 @@ impl ExtensionType {
 enum_builder! {
     /// The `ServerNameType` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognised ordinals.
+    /// The `Unknown` item is used when processing unrecognized ordinals.
     #[repr(u8)]
     pub(crate) enum ServerNameType {
         HostName => 0x00,
@@ -190,7 +148,7 @@ enum_builder! {
 enum_builder! {
     /// The `NamedGroup` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognised ordinals.
+    /// The `Unknown` item is used when processing unrecognized ordinals.
     ///
     /// This enum is used for recognizing key exchange groups advertised
     /// by a peer during a TLS handshake. It is **not** a list of groups that
@@ -263,7 +221,7 @@ impl NamedGroup {
 enum_builder! {
     /// The `ECPointFormat` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognised ordinals.
+    /// The `Unknown` item is used when processing unrecognized ordinals.
     #[repr(u8)]
     pub enum ECPointFormat {
         Uncompressed => 0x00,
@@ -275,7 +233,7 @@ enum_builder! {
 enum_builder! {
     /// The `HeartbeatMode` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognised ordinals.
+    /// The `Unknown` item is used when processing unrecognized ordinals.
     #[repr(u8)]
     pub(crate) enum HeartbeatMode {
         PeerAllowedToSend => 0x01,
@@ -286,7 +244,7 @@ enum_builder! {
 enum_builder! {
     /// The `ECCurveType` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognised ordinals.
+    /// The `Unknown` item is used when processing unrecognized ordinals.
     #[repr(u8)]
     pub(crate) enum ECCurveType {
         ExplicitPrime => 0x01,
@@ -298,7 +256,7 @@ enum_builder! {
 enum_builder! {
     /// The `PskKeyExchangeMode` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognised ordinals.
+    /// The `Unknown` item is used when processing unrecognized ordinals.
     #[repr(u8)]
     pub enum PskKeyExchangeMode {
         PSK_KE => 0x00,
@@ -309,7 +267,7 @@ enum_builder! {
 enum_builder! {
     /// The `KeyUpdateRequest` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognised ordinals.
+    /// The `Unknown` item is used when processing unrecognized ordinals.
     #[repr(u8)]
     pub enum KeyUpdateRequest {
         UpdateNotRequested => 0x00,
@@ -320,7 +278,7 @@ enum_builder! {
 enum_builder! {
     /// The `CertificateStatusType` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognised ordinals.
+    /// The `Unknown` item is used when processing unrecognized ordinals.
     #[repr(u8)]
     pub enum CertificateStatusType {
         OCSP => 0x01,
@@ -348,17 +306,13 @@ enum_builder! {
     ///
     /// [RFC 9180 Section 7.2]: <https://datatracker.ietf.org/doc/html/rfc9180#name-key-derivation-functions-kd>
     #[repr(u16)]
+    #[derive(Default)]
     pub enum HpkeKdf {
+        // TODO(XXX): revisit the default configuration. This is just what Cloudflare ships right now.
+        #[default]
         HKDF_SHA256 => 0x0001,
         HKDF_SHA384 => 0x0002,
         HKDF_SHA512 => 0x0003,
-    }
-}
-
-impl Default for HpkeKdf {
-    // TODO(XXX): revisit the default configuration. This is just what Cloudflare ships right now.
-    fn default() -> Self {
-        Self::HKDF_SHA256
     }
 }
 
@@ -368,7 +322,10 @@ enum_builder! {
     ///
     /// [RFC 9180 Section 7.3]: <https://datatracker.ietf.org/doc/html/rfc9180#name-authenticated-encryption-wi>
     #[repr(u16)]
+    #[derive(Default)]
     pub enum HpkeAead {
+        // TODO(XXX): revisit the default configuration. This is just what Cloudflare ships right now.
+        #[default]
         AES_128_GCM => 0x0001,
         AES_256_GCM => 0x0002,
         CHACHA20_POLY_1305 => 0x0003,
@@ -386,13 +343,6 @@ impl HpkeAead {
             Self::AES_128_GCM | Self::AES_256_GCM | Self::CHACHA20_POLY_1305 => Some(16),
             _ => None,
         }
-    }
-}
-
-impl Default for HpkeAead {
-    // TODO(XXX): revisit the default configuration. This is just what Cloudflare ships right now.
-    fn default() -> Self {
-        Self::AES_128_GCM
     }
 }
 
@@ -420,7 +370,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_enums() {
-        test_enum8::<HashAlgorithm>(HashAlgorithm::NONE, HashAlgorithm::SHA512);
         test_enum8::<ClientCertificateType>(
             ClientCertificateType::RSASign,
             ClientCertificateType::ECDSAFixedECDH,

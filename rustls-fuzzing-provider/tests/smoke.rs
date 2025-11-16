@@ -11,7 +11,7 @@ use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
 
 #[test]
 fn pairwise_tls12() {
-    let transcript = test_version(rustls_fuzzing_provider::provider().with_only_tls12());
+    let transcript = test_version(rustls_fuzzing_provider::PROVIDER_TLS12);
 
     fs::write(
         "../fuzz/corpus/unbuffered/tls12-server.bin",
@@ -42,7 +42,7 @@ fn pairwise_tls12() {
 
 #[test]
 fn pairwise_tls13() {
-    let transcript = test_version(rustls_fuzzing_provider::provider().with_only_tls13());
+    let transcript = test_version(rustls_fuzzing_provider::PROVIDER_TLS13);
 
     fs::write(
         "../fuzz/corpus/unbuffered/tls13-server.bin",
@@ -74,13 +74,13 @@ fn pairwise_tls13() {
 fn test_version(provider: CryptoProvider) -> Transcript {
     let _ = env_logger::try_init();
 
-    let server_config = ServerConfig::builder_with_provider(provider.clone().into())
+    let server_config = ServerConfig::builder(provider.clone().into())
         .with_no_client_auth()
-        .with_cert_resolver(rustls_fuzzing_provider::server_cert_resolver())
+        .with_server_credential_resolver(rustls_fuzzing_provider::server_cert_resolver())
         .unwrap();
     let mut server = ServerConnection::new(server_config.into()).unwrap();
 
-    let client_config = ClientConfig::builder_with_provider(provider.into())
+    let client_config = ClientConfig::builder(provider.into())
         .dangerous()
         .with_custom_certificate_verifier(rustls_fuzzing_provider::server_verifier())
         .with_no_client_auth()

@@ -9,7 +9,6 @@
     clippy::use_self,
     clippy::upper_case_acronyms,
     elided_lifetimes_in_paths,
-    trivial_casts,
     trivial_numeric_casts,
     unreachable_pub,
     unused_import_braces,
@@ -29,15 +28,16 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
 use rustls::client::{Resumption, UnbufferedClientConnection};
-use rustls::crypto::CryptoProvider;
+use rustls::crypto::{CryptoProvider, Identity};
+use rustls::enums::{CipherSuite, ProtocolVersion};
 use rustls::server::{
-    NoServerSessionStorage, ProducesTickets, ServerSessionMemoryCache, UnbufferedServerConnection,
+    NoServerSessionStorage, ServerSessionMemoryCache, UnbufferedServerConnection,
     WebPkiClientVerifier,
 };
 use rustls::unbuffered::{ConnectionState, EncryptError, InsufficientSizeError, UnbufferedStatus};
 use rustls::{
-    CipherSuite, ClientConfig, ClientConnection, ConnectionCommon, Error, HandshakeKind,
-    ProtocolVersion, RootCertStore, ServerConfig, ServerConnection, SideData,
+    ClientConfig, ClientConnection, ConnectionCommon, HandshakeKind, RootCertStore, ServerConfig,
+    ServerConnection, SideData,
 };
 use rustls_test::KeyType;
 
@@ -466,7 +466,7 @@ fn multithreaded(
 
         threads
             .into_iter()
-            .map(|thr| thr.join().unwrap())
+            .map(|thread| thread.join().unwrap())
             .collect::<Vec<Timings>>()
     })
 }
@@ -797,27 +797,27 @@ impl Parameters {
         let provider = Arc::new(self.provider.build());
         let client_auth = match self.client_auth {
             ClientAuth::Yes => {
-                let roots = self.proto.key_type.get_chain();
+                let Identity::X509(id) = &*self.proto.key_type.identity() else {
+                    panic!("client auth requested but no X.509 identity available");
+                };
+
                 let mut client_auth_roots = RootCertStore::empty();
-                for root in roots {
-                    client_auth_roots.add(root).unwrap();
+                for root in &id.intermediates {
+                    client_auth_roots
+                        .add(root.clone())
+                        .unwrap();
                 }
-                WebPkiClientVerifier::builder_with_provider(
-                    client_auth_roots.into(),
-                    provider.clone(),
-                )
-                .build()
-                .unwrap()
+
+                WebPkiClientVerifier::builder(client_auth_roots.into(), &provider)
+                    .build()
+                    .unwrap()
             }
             ClientAuth::No => WebPkiClientVerifier::no_client_auth(),
         };
 
-        let mut cfg = ServerConfig::builder_with_provider(provider)
+        let mut cfg = ServerConfig::builder(provider)
             .with_client_cert_verifier(client_auth)
-            .with_single_cert(
-                self.proto.key_type.get_chain(),
-                self.proto.key_type.get_key(),
-            )
+            .with_single_cert(self.proto.key_type.identity(), self.proto.key_type.key())
             .expect("bad certs/private key?");
 
         match self.resume {
@@ -825,7 +825,12 @@ impl Parameters {
                 cfg.session_storage = ServerSessionMemoryCache::new(128);
             }
             ResumptionParam::Tickets => {
-                cfg.ticketer = self.provider.ticketer().unwrap();
+                cfg.ticketer = Some(
+                    cfg.crypto_provider()
+                        .ticketer_factory
+                        .ticketer()
+                        .unwrap(),
+                );
             }
             ResumptionParam::No => {
                 cfg.session_storage = Arc::new(NoServerSessionStorage {});
@@ -842,7 +847,7 @@ impl Parameters {
             .add(self.proto.key_type.ca_cert())
             .unwrap();
 
-        let cfg = ClientConfig::builder_with_provider(
+        let cfg = ClientConfig::builder(
             self.provider
                 .build_with_cipher_suite(self.proto.ciphersuite)
                 .into(),
@@ -852,8 +857,8 @@ impl Parameters {
         let mut cfg = match self.client_auth {
             ClientAuth::Yes => cfg
                 .with_client_auth_cert(
-                    self.proto.key_type.get_client_chain(),
-                    self.proto.key_type.get_client_key(),
+                    self.proto.key_type.client_identity(),
+                    self.proto.key_type.client_key(),
                 )
                 .unwrap(),
             ClientAuth::No => cfg.with_no_client_auth().unwrap(),
@@ -964,27 +969,13 @@ impl Provider {
     fn build(self) -> CryptoProvider {
         match self {
             #[cfg(feature = "aws-lc-rs")]
-            Self::AwsLcRs => rustls::crypto::aws_lc_rs::default_provider(),
+            Self::AwsLcRs => rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER,
             #[cfg(all(feature = "aws-lc-rs", feature = "fips"))]
             Self::AwsLcRsFips => rustls::crypto::default_fips_provider(),
             #[cfg(feature = "graviola")]
             Self::Graviola => rustls_graviola::default_provider(),
             #[cfg(feature = "ring")]
-            Self::Ring => rustls::crypto::ring::default_provider(),
-            Self::_None => unreachable!(),
-        }
-    }
-
-    fn ticketer(self) -> Result<Arc<dyn ProducesTickets>, Error> {
-        match self {
-            #[cfg(feature = "aws-lc-rs")]
-            Self::AwsLcRs => rustls::crypto::aws_lc_rs::Ticketer::new(),
-            #[cfg(all(feature = "aws-lc-rs", feature = "fips"))]
-            Self::AwsLcRsFips => rustls::crypto::aws_lc_rs::Ticketer::new(),
-            #[cfg(feature = "graviola")]
-            Self::Graviola => rustls_graviola::Ticketer::new(),
-            #[cfg(feature = "ring")]
-            Self::Ring => rustls::crypto::ring::Ticketer::new(),
+            Self::Ring => rustls::crypto::ring::DEFAULT_PROVIDER,
             Self::_None => unreachable!(),
         }
     }
@@ -993,9 +984,11 @@ impl Provider {
         let mut provider = self.build();
         provider
             .tls12_cipher_suites
+            .to_mut()
             .retain(|cs| cs.common.suite == name);
         provider
             .tls13_cipher_suites
+            .to_mut()
             .retain(|cs| cs.common.suite == name);
         provider
     }

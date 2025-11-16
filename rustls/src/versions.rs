@@ -1,4 +1,6 @@
 use crate::enums::ProtocolVersion;
+use crate::tls12::Tls12CipherSuite;
+use crate::tls13::Tls13CipherSuite;
 
 /// A TLS protocol version supported by rustls.
 ///
@@ -77,8 +79,8 @@ pub static TLS13_VERSION: &Tls13Version = &Tls13Version {
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct Tls12Version {
-    pub(crate) client: &'static dyn crate::client::Tls12Handler,
-    pub(crate) server: &'static dyn crate::server::Tls12Handler,
+    pub(crate) client: &'static dyn crate::client::ClientHandler<Tls12CipherSuite>,
+    pub(crate) server: &'static dyn crate::server::ServerHandler<Tls12CipherSuite>,
 }
 
 /// Internal data for handling the TLS1.3 protocol.
@@ -87,6 +89,6 @@ pub struct Tls12Version {
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct Tls13Version {
-    pub(crate) client: &'static dyn crate::client::Tls13Handler,
-    pub(crate) server: &'static dyn crate::server::Tls13Handler,
+    pub(crate) client: &'static dyn crate::client::ClientHandler<Tls13CipherSuite>,
+    pub(crate) server: &'static dyn crate::server::ServerHandler<Tls13CipherSuite>,
 }

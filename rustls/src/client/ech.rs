@@ -5,14 +5,17 @@ use alloc::vec::Vec;
 use pki_types::{DnsName, EchConfigListBytes, ServerName};
 use subtle::ConstantTimeEq;
 
-use crate::CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV;
 use crate::client::tls13;
 use crate::crypto::SecureRandom;
+use crate::crypto::cipher::Payload;
 use crate::crypto::hash::Hash;
 use crate::crypto::hpke::{EncapsulatedSecret, Hpke, HpkePublicKey, HpkeSealer, HpkeSuite};
+use crate::enums::CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV;
+use crate::enums::{AlertDescription, ProtocolVersion};
+use crate::error::{EncryptedClientHelloError, Error, PeerMisbehaved, RejectedEch};
 use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
 use crate::log::{debug, trace, warn};
-use crate::msgs::base::{Payload, PayloadU16};
+use crate::msgs::base::PayloadU16;
 use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::enums::{ExtensionType, HpkeKem};
 use crate::msgs::handshake::{
@@ -27,10 +30,7 @@ use crate::msgs::persist::Retrieved;
 use crate::tls13::key_schedule::{
     KeyScheduleEarly, KeyScheduleHandshakeStart, server_ech_hrr_confirmation_secret,
 };
-use crate::{
-    AlertDescription, ClientConfig, CommonState, EncryptedClientHelloError, Error, PeerMisbehaved,
-    ProtocolVersion, RejectedEch, Tls13CipherSuite,
-};
+use crate::{ClientConfig, CommonState, Tls13CipherSuite};
 
 /// Controls how Encrypted Client Hello (ECH) is used in a client handshake.
 #[non_exhaustive]
@@ -132,9 +132,10 @@ impl EchConfig {
         EchState::new(
             self,
             server_name.clone(),
-            config
+            !config
                 .client_auth_cert_resolver
-                .has_certs(),
+                .supported_certificate_types()
+                .is_empty(),
             config.provider.secure_random,
             config.enable_sni,
         )
@@ -155,20 +156,11 @@ impl EchConfig {
         ech_configs: Vec<EchConfigPayload>,
         hpke_suites: &[&'static dyn Hpke],
     ) -> Result<Self, Error> {
-        // Note: we name the index var _i because if the log feature is disabled
-        //       it is unused.
-        #[cfg_attr(not(feature = "log"), allow(clippy::unused_enumerate_index))]
-        for (_i, config) in ech_configs.iter().enumerate() {
+        for (i, config) in ech_configs.iter().enumerate() {
             let contents = match config {
                 EchConfigPayload::V18(contents) => contents,
-                EchConfigPayload::Unknown {
-                    version: _version, ..
-                } => {
-                    warn!(
-                        "ECH config {} has unsupported version {:?}",
-                        _i + 1,
-                        _version
-                    );
+                EchConfigPayload::Unknown { version, .. } => {
+                    warn!("ECH config {} has unsupported version {:?}", i + 1, version);
                     continue; // Unsupported version.
                 }
             };

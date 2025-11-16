@@ -19,6 +19,7 @@
 //!
 //! [mio]: https://docs.rs/mio/latest/mio/
 
+use std::borrow::Cow;
 use std::io::{self, Read, Write};
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
@@ -26,10 +27,11 @@ use std::{process, str};
 
 use clap::Parser;
 use mio::net::TcpStream;
-use rustls::crypto::{CryptoProvider, SupportedKxGroup, aws_lc_rs as provider};
+use rustls::RootCertStore;
+use rustls::crypto::{CryptoProvider, Identity, SupportedKxGroup, aws_lc_rs as provider};
+use rustls::enums::ProtocolVersion;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ProtocolVersion, RootCertStore};
 
 const CLIENT: mio::Token = mio::Token(0);
 
@@ -277,27 +279,29 @@ struct Args {
 impl Args {
     fn provider(&self) -> CryptoProvider {
         let kx_groups = match self.key_exchange.as_slice() {
-            [] => provider::DEFAULT_KX_GROUPS.to_vec(),
-            items => items
-                .iter()
-                .map(|kx| find_key_exchange(kx))
-                .collect::<Vec<&'static dyn SupportedKxGroup>>(),
+            [] => Cow::Borrowed(provider::DEFAULT_KX_GROUPS),
+            items => Cow::Owned(
+                items
+                    .iter()
+                    .map(|kx| find_key_exchange(kx))
+                    .collect::<Vec<&'static dyn SupportedKxGroup>>(),
+            ),
+        };
+
+        let provider = match lookup_versions(&self.protover).as_slice() {
+            [ProtocolVersion::TLSv1_2] => provider::DEFAULT_TLS12_PROVIDER,
+            [ProtocolVersion::TLSv1_3] => provider::DEFAULT_TLS13_PROVIDER,
+            _ => provider::DEFAULT_PROVIDER,
         };
 
         let provider = CryptoProvider {
             kx_groups,
-            ..provider::default_provider()
+            ..provider
         };
 
-        let provider = match self.suite.as_slice() {
+        match self.suite.as_slice() {
             [] => provider,
             _ => filter_suites(provider, &self.suite),
-        };
-
-        match lookup_versions(&self.protover).as_slice() {
-            [ProtocolVersion::TLSv1_2] => provider.with_only_tls12(),
-            [ProtocolVersion::TLSv1_3] => provider.with_only_tls13(),
-            _ => provider,
         }
     }
 }
@@ -343,6 +347,7 @@ fn filter_suites(mut provider: CryptoProvider, suites: &[String]) -> CryptoProvi
     // now discard non-named suites
     provider
         .tls12_cipher_suites
+        .to_mut()
         .retain(|cs| {
             let name = format!("{:?}", cs.common.suite).to_lowercase();
             suites
@@ -351,6 +356,7 @@ fn filter_suites(mut provider: CryptoProvider, suites: &[String]) -> CryptoProvi
         });
     provider
         .tls13_cipher_suites
+        .to_mut()
         .retain(|cs| {
             let name = format!("{:?}", cs.common.suite).to_lowercase();
             suites
@@ -391,10 +397,12 @@ fn load_private_key(filename: &str) -> PrivateKeyDer<'static> {
 }
 
 mod danger {
+    use rustls::Error;
     use rustls::client::danger::{
         HandshakeSignatureValid, ServerIdentity, SignatureVerificationInput,
     };
     use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
+    use rustls::enums::SignatureScheme;
 
     #[derive(Debug)]
     pub struct NoCertificateVerification(CryptoProvider);
@@ -405,29 +413,29 @@ mod danger {
         }
     }
 
-    impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
-        fn verify_server_cert(
+    impl rustls::client::danger::ServerVerifier for NoCertificateVerification {
+        fn verify_identity(
             &self,
             _identity: &ServerIdentity<'_>,
-        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        ) -> Result<rustls::client::danger::PeerVerified, Error> {
+            Ok(rustls::client::danger::PeerVerified::assertion())
         }
 
         fn verify_tls12_signature(
             &self,
             input: &SignatureVerificationInput<'_>,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        ) -> Result<HandshakeSignatureValid, Error> {
             verify_tls12_signature(input, &self.0.signature_verification_algorithms)
         }
 
         fn verify_tls13_signature(
             &self,
             input: &SignatureVerificationInput<'_>,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        ) -> Result<HandshakeSignatureValid, Error> {
             verify_tls13_signature(input, &self.0.signature_verification_algorithms)
         }
 
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
             self.0
                 .signature_verification_algorithms
                 .supported_schemes()
@@ -457,15 +465,15 @@ fn make_config(args: &Args) -> Arc<rustls::ClientConfig> {
         );
     }
 
-    let config = rustls::ClientConfig::builder_with_provider(args.provider().into())
-        .with_root_certificates(root_store);
+    let config =
+        rustls::ClientConfig::builder(args.provider().into()).with_root_certificates(root_store);
 
     let mut config = match (&args.auth_key, &args.auth_certs) {
         (Some(key_file), Some(certs_file)) => {
             let certs = load_certs(certs_file);
             let key = load_private_key(key_file);
             config
-                .with_client_auth_cert(certs, key)
+                .with_client_auth_cert(Arc::new(Identity::from_cert_chain(certs).unwrap()), key)
                 .expect("invalid client auth certs/key")
         }
         (None, None) => config.with_no_client_auth().unwrap(),
@@ -497,7 +505,7 @@ fn make_config(args: &Args) -> Arc<rustls::ClientConfig> {
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(danger::NoCertificateVerification::new(
-                provider::default_provider(),
+                provider::DEFAULT_PROVIDER,
             )));
     }
 

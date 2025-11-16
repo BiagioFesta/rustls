@@ -28,11 +28,12 @@ use std::{fs, net};
 use clap::{Parser, Subcommand};
 use log::{debug, error};
 use mio::net::{TcpListener, TcpStream};
-use rustls::crypto::{CryptoProvider, aws_lc_rs as provider};
+use rustls::RootCertStore;
+use rustls::crypto::{CryptoProvider, Identity, aws_lc_rs as provider};
+use rustls::enums::ProtocolVersion;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
-use rustls::{ProtocolVersion, RootCertStore};
 
 // Token for our listening socket.
 const LISTENER: mio::Token = mio::Token(0);
@@ -473,22 +474,25 @@ struct Args {
 
 impl Args {
     fn provider(&self) -> (Vec<ProtocolVersion>, CryptoProvider) {
-        let provider = provider::default_provider();
+        let (versions, provider) = match lookup_versions(&self.protover).as_slice() {
+            versions @ [ProtocolVersion::TLSv1_2] => {
+                (versions.to_vec(), provider::DEFAULT_TLS12_PROVIDER)
+            }
+            versions @ [ProtocolVersion::TLSv1_3] => {
+                (versions.to_vec(), provider::DEFAULT_TLS13_PROVIDER)
+            }
+            _ => (
+                vec![ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3],
+                provider::DEFAULT_PROVIDER,
+            ),
+        };
 
         let provider = match self.suite.as_slice() {
             [] => provider,
             _ => filter_suites(provider, &self.suite),
         };
 
-        let versions = lookup_versions(&self.protover);
-        match versions.as_slice() {
-            [ProtocolVersion::TLSv1_2] => (versions, provider.with_only_tls12()),
-            [ProtocolVersion::TLSv1_3] => (versions, provider.with_only_tls13()),
-            _ => (
-                vec![ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3],
-                provider,
-            ),
-        }
+        (versions, provider)
     }
 }
 
@@ -510,13 +514,17 @@ fn filter_suites(mut provider: CryptoProvider, suites: &[String]) -> CryptoProvi
 
     for s in suites {
         if !known_suites.contains(&s.to_lowercase()) {
-            panic!("cannot look up ciphersuite '{s}'. should be one of {known_suites:?}");
+            panic!(
+                "unsupported ciphersuite '{s}'; should be one of {known_suites}",
+                known_suites = known_suites.join(", ")
+            );
         }
     }
 
     // now discard non-named suites
     provider
         .tls12_cipher_suites
+        .to_mut()
         .retain(|cs| {
             let name = format!("{:?}", cs.common.suite).to_lowercase();
             suites
@@ -525,6 +533,7 @@ fn filter_suites(mut provider: CryptoProvider, suites: &[String]) -> CryptoProvi
         });
     provider
         .tls13_cipher_suites
+        .to_mut()
         .retain(|cs| {
             let name = format!("{:?}", cs.common.suite).to_lowercase();
             suites
@@ -588,6 +597,7 @@ fn load_crls(
 }
 
 fn make_config(args: &Args) -> Arc<rustls::ServerConfig> {
+    let (versions, provider) = args.provider();
     let client_auth = if let Some(auth) = &args.auth {
         let roots = load_certs(auth);
         let mut client_auth_roots = RootCertStore::empty();
@@ -596,12 +606,12 @@ fn make_config(args: &Args) -> Arc<rustls::ServerConfig> {
         }
         let crls = load_crls(args.crl.iter());
         if args.require_auth {
-            WebPkiClientVerifier::builder(client_auth_roots.into())
+            WebPkiClientVerifier::builder(client_auth_roots.into(), &provider)
                 .with_crls(crls)
                 .build()
                 .unwrap()
         } else {
-            WebPkiClientVerifier::builder(client_auth_roots.into())
+            WebPkiClientVerifier::builder(client_auth_roots.into(), &provider)
                 .with_crls(crls)
                 .allow_unauthenticated()
                 .build()
@@ -615,10 +625,13 @@ fn make_config(args: &Args) -> Arc<rustls::ServerConfig> {
     let privkey = load_private_key(&args.key);
     let ocsp = load_ocsp(args.ocsp.as_deref());
 
-    let (versions, provider) = args.provider();
-    let mut config = rustls::ServerConfig::builder_with_provider(provider.into())
+    let mut config = rustls::ServerConfig::builder(provider.into())
         .with_client_cert_verifier(client_auth)
-        .with_single_cert_with_ocsp(certs, privkey, ocsp)
+        .with_single_cert_with_ocsp(
+            Arc::new(Identity::from_cert_chain(certs).unwrap()),
+            privkey,
+            Arc::from(ocsp),
+        )
         .expect("bad certificates/private key");
 
     config.key_log = Arc::new(rustls::KeyLogFile::new());
@@ -628,7 +641,12 @@ fn make_config(args: &Args) -> Arc<rustls::ServerConfig> {
     }
 
     if args.tickets {
-        config.ticketer = provider::Ticketer::new().unwrap();
+        config.ticketer = Some(
+            provider::DEFAULT_PROVIDER
+                .ticketer_factory
+                .ticketer()
+                .unwrap(),
+        );
     }
 
     if args.max_early_data > 0 {

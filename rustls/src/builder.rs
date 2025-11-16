@@ -13,27 +13,28 @@ use crate::{ClientConfig, ServerConfig};
 ///
 /// To get one of these, call [`ServerConfig::builder()`] or [`ClientConfig::builder()`].
 ///
-/// To build a config, you must make at least two decisions (in order):
+/// To build a config, you must make at least three decisions (in order):
 ///
+/// - What crypto provider do you want to use?
 /// - How should this client or server verify certificates provided by its peer?
 /// - What certificates should this client or server present to its peer?
 ///
 /// For settings besides these, see the fields of [`ServerConfig`] and [`ClientConfig`].
 ///
-/// The usual choice for protocol primitives is to call
-/// [`ClientConfig::builder`]/[`ServerConfig::builder`]
-/// which will use rustls' default cryptographic provider and safe defaults for ciphersuites and
-/// protocol versions.
+/// The rustls project recommends the crypto provider based on aws-lc-rs for production use.
+/// This can be selected by passing in [`crate::crypto::aws_lc_rs::DEFAULT_PROVIDER`],
+/// which includes safe defaults for cipher suites and protocol versions.
 ///
 /// ```
 /// # #[cfg(feature = "aws-lc-rs")] {
-/// # rustls::crypto::aws_lc_rs::default_provider().install_default();
+/// # use std::sync::Arc;
 /// use rustls::{ClientConfig, ServerConfig};
-/// ClientConfig::builder()
+/// use rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER;
+/// ClientConfig::builder(Arc::new(DEFAULT_PROVIDER))
 /// //  ...
 /// # ;
 ///
-/// ServerConfig::builder()
+/// ServerConfig::builder(Arc::new(DEFAULT_PROVIDER))
 /// //  ...
 /// # ;
 /// # }
@@ -57,16 +58,17 @@ use crate::{ClientConfig, ServerConfig};
 /// or disabled using one of:
 /// - [`ConfigBuilder::with_no_client_auth`] - to not send client authentication (most common)
 /// - [`ConfigBuilder::with_client_auth_cert`] - to always send a specific certificate
-/// - [`ConfigBuilder::with_client_cert_resolver`] - to send a certificate chosen dynamically
+/// - [`ConfigBuilder::with_server_credential_resolver`] - to send a certificate chosen dynamically
 ///
 /// For example:
 ///
 /// ```
 /// # #[cfg(feature = "aws-lc-rs")] {
-/// # rustls::crypto::aws_lc_rs::default_provider().install_default();
+/// # use std::sync::Arc;
+/// # use rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER;
 /// # use rustls::ClientConfig;
 /// # let root_certs = rustls::RootCertStore::empty();
-/// ClientConfig::builder()
+/// ClientConfig::builder(Arc::new(DEFAULT_PROVIDER))
 ///     .with_root_certificates(root_certs)
 ///     .with_no_client_auth()
 ///     .unwrap();
@@ -82,21 +84,23 @@ use crate::{ClientConfig, ServerConfig};
 /// Next, _certificate sending_ must be configured by calling one of:
 /// - [`ConfigBuilder::with_single_cert`] - to send a specific certificate
 /// - [`ConfigBuilder::with_single_cert_with_ocsp`] - to send a specific certificate, plus stapled OCSP
-/// - [`ConfigBuilder::with_cert_resolver`] - to send a certificate chosen dynamically
+/// - [`ConfigBuilder::with_server_credential_resolver`] - to send a certificate chosen dynamically
 ///
 /// For example:
 ///
 /// ```no_run
 /// # #[cfg(feature = "aws-lc-rs")] {
-/// # rustls::crypto::aws_lc_rs::default_provider().install_default();
+/// # use std::sync::Arc;
+/// # use rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER;
+/// # use rustls::crypto::Identity;
 /// # use rustls::ServerConfig;
 /// # let certs = vec![];
 /// # let private_key = pki_types::PrivateKeyDer::from(
 /// #    pki_types::PrivatePkcs8KeyDer::from(vec![])
 /// # );
-/// ServerConfig::builder()
+/// ServerConfig::builder(Arc::new(DEFAULT_PROVIDER))
 ///     .with_no_client_auth()
-///     .with_single_cert(certs, private_key)
+///     .with_single_cert(Arc::new(Identity::from_cert_chain(certs).unwrap()), private_key)
 ///     .expect("bad certificate/key/provider");
 /// # }
 /// ```
@@ -121,9 +125,9 @@ use crate::{ClientConfig, ServerConfig};
 /// mentioning some of these types.
 ///
 /// Additionally, ServerConfig and ClientConfig carry a private field containing a
-/// [`CryptoProvider`], from [`ClientConfig::builder_with_provider()`] or
-/// [`ServerConfig::builder_with_provider()`]. This determines which cryptographic backend
-/// is used. The default is [the process-default provider](`CryptoProvider::get_default`).
+/// [`CryptoProvider`], from [`ClientConfig::builder()`] or
+/// [`ServerConfig::builder()`]. This determines which cryptographic backend
+/// is used.
 ///
 /// [builder]: https://rust-unofficial.github.io/patterns/patterns/creational/builder.html
 /// [typestate]: http://cliffle.com/blog/rust-typestate/
@@ -132,8 +136,8 @@ use crate::{ClientConfig, ServerConfig};
 /// [`ClientConfig`]: crate::ClientConfig
 /// [`ClientConfig::builder()`]: crate::ClientConfig::builder()
 /// [`ServerConfig::builder()`]: crate::ServerConfig::builder()
-/// [`ClientConfig::builder_with_provider()`]: crate::ClientConfig::builder_with_provider()
-/// [`ServerConfig::builder_with_provider()`]: crate::ServerConfig::builder_with_provider()
+/// [`ClientConfig::builder()`]: crate::ClientConfig::builder()
+/// [`ServerConfig::builder()`]: crate::ServerConfig::builder()
 /// [`ConfigBuilder<ClientConfig, WantsVerifier>`]: struct.ConfigBuilder.html#impl-3
 /// [`ConfigBuilder<ServerConfig, WantsVerifier>`]: struct.ConfigBuilder.html#impl-6
 /// [`WantsClientCert`]: crate::client::WantsClientCert

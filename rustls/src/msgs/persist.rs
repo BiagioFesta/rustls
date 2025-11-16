@@ -1,19 +1,21 @@
 use alloc::vec::Vec;
 use core::cmp;
+use core::time::Duration;
 
 use pki_types::{DnsName, UnixTime};
 use zeroize::Zeroizing;
 
-use crate::client::ResolvesClientCert;
+use crate::client::ClientCredentialResolver;
+use crate::crypto::Identity;
 use crate::enums::{CipherSuite, ProtocolVersion};
 use crate::error::InvalidMessage;
 use crate::msgs::base::{MaybeEmpty, PayloadU8, PayloadU16};
 use crate::msgs::codec::{Codec, Reader};
-use crate::msgs::handshake::{CertificateChain, ProtocolName, SessionId};
+use crate::msgs::handshake::{ProtocolName, SessionId};
 use crate::sync::{Arc, Weak};
 use crate::tls12::Tls12CipherSuite;
 use crate::tls13::Tls13CipherSuite;
-use crate::verify::ServerCertVerifier;
+use crate::verify::ServerVerifier;
 
 pub(crate) struct Retrieved<T> {
     pub(crate) value: T,
@@ -50,10 +52,10 @@ impl Retrieved<&Tls13ClientSessionValue> {
 impl<T: core::ops::Deref<Target = ClientSessionCommon>> Retrieved<T> {
     pub(crate) fn has_expired(&self) -> bool {
         let common = &*self.value;
-        common.lifetime_secs != 0
+        common.lifetime != Duration::ZERO
             && common
                 .epoch
-                .saturating_add(u64::from(common.lifetime_secs))
+                .saturating_add(common.lifetime.as_secs())
                 < self.retrieved_at.as_secs()
     }
 }
@@ -81,11 +83,11 @@ impl Tls13ClientSessionValue {
         suite: &'static Tls13CipherSuite,
         ticket: Arc<PayloadU16>,
         secret: &[u8],
-        server_cert_chain: CertificateChain<'static>,
-        server_cert_verifier: &Arc<dyn ServerCertVerifier>,
-        client_creds: &Arc<dyn ResolvesClientCert>,
+        peer_identity: Identity<'static>,
+        server_cert_verifier: &Arc<dyn ServerVerifier>,
+        client_creds: &Arc<dyn ClientCredentialResolver>,
         time_now: UnixTime,
-        lifetime_secs: u32,
+        lifetime: Duration,
         age_add: u32,
         max_early_data_size: u32,
     ) -> Self {
@@ -97,8 +99,8 @@ impl Tls13ClientSessionValue {
             common: ClientSessionCommon::new(
                 ticket,
                 time_now,
-                lifetime_secs,
-                server_cert_chain,
+                lifetime,
+                peer_identity,
                 server_cert_verifier,
                 client_creds,
             ),
@@ -163,11 +165,11 @@ impl Tls12ClientSessionValue {
         session_id: SessionId,
         ticket: Arc<PayloadU16>,
         master_secret: &[u8; 48],
-        server_cert_chain: CertificateChain<'static>,
-        server_cert_verifier: &Arc<dyn ServerCertVerifier>,
-        client_creds: &Arc<dyn ResolvesClientCert>,
+        peer_identity: Identity<'static>,
+        server_cert_verifier: &Arc<dyn ServerVerifier>,
+        client_creds: &Arc<dyn ClientCredentialResolver>,
         time_now: UnixTime,
-        lifetime_secs: u32,
+        lifetime: Duration,
         extended_ms: bool,
     ) -> Self {
         Self {
@@ -178,8 +180,8 @@ impl Tls12ClientSessionValue {
             common: ClientSessionCommon::new(
                 ticket,
                 time_now,
-                lifetime_secs,
-                server_cert_chain,
+                lifetime,
+                peer_identity,
                 server_cert_verifier,
                 client_creds,
             ),
@@ -221,26 +223,26 @@ impl core::ops::Deref for Tls12ClientSessionValue {
 pub struct ClientSessionCommon {
     ticket: Arc<PayloadU16>,
     epoch: u64,
-    lifetime_secs: u32,
-    server_cert_chain: Arc<CertificateChain<'static>>,
-    server_cert_verifier: Weak<dyn ServerCertVerifier>,
-    client_creds: Weak<dyn ResolvesClientCert>,
+    lifetime: Duration,
+    peer_identity: Arc<Identity<'static>>,
+    server_cert_verifier: Weak<dyn ServerVerifier>,
+    client_creds: Weak<dyn ClientCredentialResolver>,
 }
 
 impl ClientSessionCommon {
     fn new(
         ticket: Arc<PayloadU16>,
         time_now: UnixTime,
-        lifetime_secs: u32,
-        server_cert_chain: CertificateChain<'static>,
-        server_cert_verifier: &Arc<dyn ServerCertVerifier>,
-        client_creds: &Arc<dyn ResolvesClientCert>,
+        lifetime: Duration,
+        peer_identity: Identity<'static>,
+        server_cert_verifier: &Arc<dyn ServerVerifier>,
+        client_creds: &Arc<dyn ClientCredentialResolver>,
     ) -> Self {
         Self {
             ticket,
             epoch: time_now.as_secs(),
-            lifetime_secs: cmp::min(lifetime_secs, MAX_TICKET_LIFETIME),
-            server_cert_chain: Arc::new(server_cert_chain),
+            lifetime: cmp::min(lifetime, MAX_TICKET_LIFETIME),
+            peer_identity: Arc::new(peer_identity),
             server_cert_verifier: Arc::downgrade(server_cert_verifier),
             client_creds: Arc::downgrade(client_creds),
         }
@@ -248,8 +250,8 @@ impl ClientSessionCommon {
 
     pub(crate) fn compatible_config(
         &self,
-        server_cert_verifier: &Arc<dyn ServerCertVerifier>,
-        client_creds: &Arc<dyn ResolvesClientCert>,
+        server_cert_verifier: &Arc<dyn ServerVerifier>,
+        client_creds: &Arc<dyn ClientCredentialResolver>,
     ) -> bool {
         let same_verifier = Weak::ptr_eq(
             &Arc::downgrade(server_cert_verifier),
@@ -260,20 +262,20 @@ impl ClientSessionCommon {
         match (same_verifier, same_creds) {
             (true, true) => true,
             (false, _) => {
-                crate::log::trace!("resumption not allowed between different ServerCertVerifiers");
+                crate::log::trace!("resumption not allowed between different ServerVerifiers");
                 false
             }
             (_, _) => {
                 crate::log::trace!(
-                    "resumption not allowed between different ResolvesClientCert values"
+                    "resumption not allowed between different ClientCredentialResolver values"
                 );
                 false
             }
         }
     }
 
-    pub(crate) fn server_cert_chain(&self) -> &CertificateChain<'static> {
-        &self.server_cert_chain
+    pub(crate) fn peer_identity(&self) -> &Identity<'static> {
+        &self.peer_identity
     }
 
     pub(crate) fn ticket(&self) -> &[u8] {
@@ -281,7 +283,7 @@ impl ClientSessionCommon {
     }
 }
 
-static MAX_TICKET_LIFETIME: u32 = 7 * 24 * 60 * 60;
+static MAX_TICKET_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// This is the maximum allowed skew between server and client clocks, over
 /// the maximum ticket lifetime period.  This encompasses TCP retransmission
@@ -447,7 +449,7 @@ impl From<Tls13ServerSessionValue> for ServerSessionValue {
 pub struct CommonServerSessionValue {
     pub(crate) sni: Option<DnsName<'static>>,
     pub(crate) cipher_suite: CipherSuite,
-    pub(crate) client_cert_chain: Option<CertificateChain<'static>>,
+    pub(crate) peer_identity: Option<Identity<'static>>,
     pub(crate) alpn: Option<ProtocolName>,
     pub(crate) application_data: PayloadU16,
     #[doc(hidden)]
@@ -458,7 +460,7 @@ impl CommonServerSessionValue {
     pub(crate) fn new(
         sni: Option<&DnsName<'_>>,
         cipher_suite: CipherSuite,
-        client_cert_chain: Option<CertificateChain<'static>>,
+        peer_identity: Option<Identity<'static>>,
         alpn: Option<ProtocolName>,
         application_data: Vec<u8>,
         creation_time: UnixTime,
@@ -466,11 +468,25 @@ impl CommonServerSessionValue {
         Self {
             sni: sni.map(|s| s.to_owned()),
             cipher_suite,
-            client_cert_chain,
+            peer_identity,
             alpn,
             application_data: PayloadU16::new(application_data),
             creation_time_sec: creation_time.as_secs(),
         }
+    }
+
+    pub(crate) fn can_resume(&self, suite: CipherSuite, sni: &Option<DnsName<'_>>) -> bool {
+        // The RFCs underspecify what happens if we try to resume to
+        // an unoffered/varying suite.  We merely don't resume in weird cases.
+        //
+        // RFC 6066 says "A server that implements this extension MUST NOT accept
+        // the request to resume the session if the server_name extension contains
+        // a different name. Instead, it proceeds with a full handshake to
+        // establish a new session."
+        //
+        // RFC 8446: "The server MUST ensure that it selects
+        // a compatible PSK (if any) and cipher suite."
+        self.cipher_suite == suite && &self.sni == sni
     }
 }
 
@@ -484,9 +500,9 @@ impl Codec<'_> for CommonServerSessionValue {
             0u8.encode(bytes);
         }
         self.cipher_suite.encode(bytes);
-        if let Some(chain) = &self.client_cert_chain {
+        if let Some(identity) = &self.peer_identity {
             1u8.encode(bytes);
-            chain.encode(bytes);
+            identity.encode(bytes);
         } else {
             0u8.encode(bytes);
         }
@@ -517,8 +533,8 @@ impl Codec<'_> for CommonServerSessionValue {
         Ok(Self {
             sni,
             cipher_suite: CipherSuite::read(r)?,
-            client_cert_chain: match u8::read(r)? {
-                1 => Some(CertificateChain::read(r)?.into_owned()),
+            peer_identity: match u8::read(r)? {
+                1 => Some(Identity::read(r)?.into_owned()),
                 _ => None,
             },
             alpn: match u8::read(r)? {
@@ -533,7 +549,10 @@ impl Codec<'_> for CommonServerSessionValue {
 
 #[cfg(test)]
 mod tests {
+    use pki_types::CertificateDer;
+
     use super::*;
+    use crate::crypto::CertificateIdentity;
 
     #[cfg(feature = "std")] // for UnixTime::now
     #[test]
@@ -568,10 +587,30 @@ mod tests {
 
     #[test]
     fn serversessionvalue_with_cert() {
+        std::eprintln!(
+            "{:#04x?}",
+            ServerSessionValue::Tls13(Tls13ServerSessionValue::new(
+                CommonServerSessionValue::new(
+                    None,
+                    CipherSuite::TLS13_AES_128_GCM_SHA256,
+                    Some(Identity::X509(CertificateIdentity {
+                        end_entity: CertificateDer::from(&[10, 11, 12][..]),
+                        intermediates: alloc::vec![],
+                    })),
+                    None,
+                    alloc::vec![4, 5, 6],
+                    UnixTime::now(),
+                ),
+                &[1, 2, 3],
+                0x12345678,
+            ))
+            .get_encoding()
+        );
+
         let bytes = [
-            0x03, 0x04, 0x00, 0x13, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x04, 0x05,
-            0x06, 0x00, 0x00, 0x00, 0x00, 0x68, 0x6e, 0x94, 0x32, 0x03, 0x01, 0x02, 0x03, 0x12,
-            0x34, 0x56, 0x78,
+            0x03, 0x04, 0x00, 0x13, 0x01, 0x01, 0x00, 0x00, 0x00, 0x03, 0x0a, 0x0b, 0x0c, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x03, 0x04, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x68, 0xc1,
+            0x99, 0xac, 0x03, 0x01, 0x02, 0x03, 0x12, 0x34, 0x56, 0x78,
         ];
         let mut rd = Reader::init(&bytes);
         let ssv = ServerSessionValue::read(&mut rd).unwrap();

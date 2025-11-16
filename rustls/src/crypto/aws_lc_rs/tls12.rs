@@ -4,20 +4,18 @@ use aws_lc_rs::{aead, tls_prf};
 use zeroize::Zeroizing;
 
 use crate::crypto::cipher::{
-    AeadKey, InboundOpaqueMessage, Iv, KeyBlockShape, MessageDecrypter, MessageEncrypter,
-    NONCE_LEN, Nonce, Tls12AeadAlgorithm, UnsupportedOperationError, make_tls12_aad,
+    AeadKey, InboundOpaqueMessage, InboundPlainMessage, Iv, KeyBlockShape, MessageDecrypter,
+    MessageEncrypter, NONCE_LEN, Nonce, OutboundOpaqueMessage, OutboundPlainMessage,
+    PrefixedPayload, Tls12AeadAlgorithm, UnsupportedOperationError, make_tls12_aad,
 };
 use crate::crypto::tls12::{Prf, PrfSecret};
 use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm, SharedSecret};
-use crate::enums::{CipherSuite, SignatureScheme};
+use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
 use crate::error::Error;
 use crate::msgs::fragmenter::MAX_FRAGMENT_LEN;
-use crate::msgs::message::{
-    InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload,
-};
 use crate::suites::{CipherSuiteCommon, ConnectionTrafficSecrets};
 use crate::tls12::Tls12CipherSuite;
-use crate::version::{TLS12, TLS12_VERSION};
+use crate::version::TLS12_VERSION;
 
 /// The TLS1.2 ciphersuite TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256.
 pub static TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256: &Tls12CipherSuite = &Tls12CipherSuite {
@@ -202,7 +200,7 @@ impl Tls12AeadAlgorithm for ChaCha20Poly1305 {
         );
         Box::new(ChaCha20Poly1305MessageDecrypter {
             dec_key,
-            dec_offset: Iv::copy(iv),
+            dec_offset: Iv::new(iv).expect("IV length validated by key_block_shape"),
         })
     }
 
@@ -212,7 +210,7 @@ impl Tls12AeadAlgorithm for ChaCha20Poly1305 {
         );
         Box::new(ChaCha20Poly1305MessageEncrypter {
             enc_key,
-            enc_offset: Iv::copy(enc_iv),
+            enc_offset: Iv::new(enc_iv).expect("IV length validated by key_block_shape"),
         })
     }
 
@@ -234,7 +232,7 @@ impl Tls12AeadAlgorithm for ChaCha20Poly1305 {
         debug_assert_eq!(aead::NONCE_LEN, iv.len());
         Ok(ConnectionTrafficSecrets::Chacha20Poly1305 {
             key,
-            iv: Iv::new(iv[..].try_into().unwrap()),
+            iv: Iv::new(iv).expect("IV length validated by key_block_shape"),
         })
     }
 
@@ -311,7 +309,7 @@ impl MessageEncrypter for GcmMessageEncrypter {
         let total_len = self.encrypted_payload_len(msg.payload.len());
         let mut payload = PrefixedPayload::with_capacity(total_len);
 
-        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
+        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).to_array()?);
         let aad = aead::Aad::from(make_tls12_aad(seq, msg.typ, msg.version, msg.payload.len()));
         payload.extend_from_slice(&nonce.as_ref()[4..]);
         payload.extend_from_chunks(&msg.payload);
@@ -321,7 +319,11 @@ impl MessageEncrypter for GcmMessageEncrypter {
             .map(|tag| payload.extend_from_slice(tag.as_ref()))
             .map_err(|_| Error::EncryptError)?;
 
-        Ok(OutboundOpaqueMessage::new(msg.typ, msg.version, payload))
+        Ok(OutboundOpaqueMessage {
+            typ: msg.typ,
+            version: msg.version,
+            payload,
+        })
     }
 
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
@@ -359,7 +361,8 @@ impl MessageDecrypter for ChaCha20Poly1305MessageDecrypter {
             return Err(Error::DecryptError);
         }
 
-        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.dec_offset, seq).0);
+        let nonce =
+            aead::Nonce::assume_unique_for_key(Nonce::new(&self.dec_offset, seq).to_array()?);
         let aad = aead::Aad::from(make_tls12_aad(
             seq,
             msg.typ,
@@ -392,7 +395,8 @@ impl MessageEncrypter for ChaCha20Poly1305MessageEncrypter {
         let total_len = self.encrypted_payload_len(msg.payload.len());
         let mut payload = PrefixedPayload::with_capacity(total_len);
 
-        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.enc_offset, seq).0);
+        let nonce =
+            aead::Nonce::assume_unique_for_key(Nonce::new(&self.enc_offset, seq).to_array()?);
         let aad = aead::Aad::from(make_tls12_aad(seq, msg.typ, msg.version, msg.payload.len()));
         payload.extend_from_chunks(&msg.payload);
 
@@ -400,7 +404,11 @@ impl MessageEncrypter for ChaCha20Poly1305MessageEncrypter {
             .seal_in_place_append_tag(nonce, aad, &mut payload)
             .map_err(|_| Error::EncryptError)?;
 
-        Ok(OutboundOpaqueMessage::new(msg.typ, msg.version, payload))
+        Ok(OutboundOpaqueMessage {
+            typ: msg.typ,
+            version: msg.version,
+            payload,
+        })
     }
 
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
@@ -423,7 +431,7 @@ fn gcm_iv(write_iv: &[u8], explicit: &[u8]) -> Iv {
     iv[..4].copy_from_slice(write_iv);
     iv[4..].copy_from_slice(explicit);
 
-    Iv::new(iv)
+    Iv::new(&iv).expect("IV length is NONCE_LEN, which is within MAX_LEN")
 }
 
 struct Tls12Prf(&'static tls_prf::Algorithm);
@@ -439,7 +447,9 @@ impl Prf for Tls12Prf {
     ) -> Result<(), Error> {
         Tls12PrfSecret {
             alg: self.0,
-            secret: Secret::KeyExchange(kx.complete_for_tls_version(peer_pub_key, &TLS12)?),
+            secret: Secret::KeyExchange(
+                kx.complete_for_tls_version(peer_pub_key, ProtocolVersion::TLSv1_2)?,
+            ),
         }
         .prf(output, label, seed);
         Ok(())

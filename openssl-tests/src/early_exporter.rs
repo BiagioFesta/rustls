@@ -5,7 +5,7 @@ use std::{str, thread};
 
 use openssl::ssl::{SslConnector, SslMethod, SslSession, SslStream};
 use rustls::ServerConfig;
-use rustls::crypto::aws_lc_rs as provider;
+use rustls::crypto::{Identity, aws_lc_rs as provider};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -22,9 +22,12 @@ fn test_early_exporter() {
     let port = listener.local_addr().unwrap().port();
 
     let server_thread = thread::spawn(move || {
-        let mut config = ServerConfig::builder_with_provider(provider::default_provider().into())
+        let mut config = ServerConfig::builder(provider::DEFAULT_PROVIDER.into())
             .with_no_client_auth()
-            .with_single_cert(load_certs(), load_private_key())
+            .with_single_cert(
+                Arc::new(Identity::from_cert_chain(load_certs()).unwrap()),
+                load_private_key(),
+            )
             .unwrap();
         config.max_early_data_size = 8192;
         let config = Arc::new(config);

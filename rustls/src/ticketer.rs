@@ -1,21 +1,18 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::mem;
-#[cfg(feature = "std")]
+use core::time::Duration;
 use std::sync::{RwLock, RwLockReadGuard};
 
 use pki_types::UnixTime;
 
-use crate::Error;
-use crate::server::ProducesTickets;
-#[cfg(not(feature = "std"))]
-use crate::time_provider::TimeProvider;
+use crate::crypto::TicketProducer;
+use crate::error::Error;
 
-#[cfg(feature = "std")]
 #[derive(Debug)]
 pub(crate) struct TicketRotatorState {
-    current: Box<dyn ProducesTickets>,
-    previous: Option<Box<dyn ProducesTickets>>,
+    current: Box<dyn TicketProducer>,
+    previous: Option<Box<dyn TicketProducer>>,
     next_switch_time: u64,
 }
 
@@ -24,8 +21,8 @@ pub(crate) struct TicketRotatorState {
 /// often, demoting the current ticketer.
 #[cfg(feature = "std")]
 pub struct TicketRotator {
-    pub(crate) generator: fn() -> Result<Box<dyn ProducesTickets>, Error>,
-    lifetime: u32,
+    pub(crate) generator: fn() -> Result<Box<dyn TicketProducer>, Error>,
+    lifetime: Duration,
     state: RwLock<TicketRotatorState>,
 }
 
@@ -40,10 +37,10 @@ impl TicketRotator {
     /// be usable for at least one `lifetime`, and at most two `lifetime`s
     /// (depending on when its creation falls in the replacement cycle.)
     ///
-    /// `generator` produces a new `ProducesTickets` implementation.
+    /// `generator` produces a new [`TicketProducer`] implementation.
     pub fn new(
-        lifetime: u32,
-        generator: fn() -> Result<Box<dyn ProducesTickets>, Error>,
+        lifetime: Duration,
+        generator: fn() -> Result<Box<dyn TicketProducer>, Error>,
     ) -> Result<Self, Error> {
         Ok(Self {
             generator,
@@ -53,7 +50,7 @@ impl TicketRotator {
                 previous: None,
                 next_switch_time: UnixTime::now()
                     .as_secs()
-                    .saturating_add(u64::from(lifetime)),
+                    .saturating_add(lifetime.as_secs()),
             }),
         })
     }
@@ -101,26 +98,17 @@ impl TicketRotator {
         // - confirmed we are the thread that will do it
         // - successfully made the replacement ticketer
         write.previous = Some(mem::replace(&mut write.current, next));
-        write.next_switch_time = now.saturating_add(u64::from(self.lifetime));
+        write.next_switch_time = now.saturating_add(self.lifetime.as_secs());
         drop(write);
 
         self.state.read().ok()
     }
 
     #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-    pub(crate) const SIX_HOURS: u32 = 6 * 60 * 60;
+    pub(crate) const SIX_HOURS: Duration = Duration::from_secs(6 * 60 * 60);
 }
 
-#[cfg(feature = "std")]
-impl ProducesTickets for TicketRotator {
-    fn lifetime(&self) -> u32 {
-        self.lifetime
-    }
-
-    fn enabled(&self) -> bool {
-        true
-    }
-
+impl TicketProducer for TicketRotator {
     fn encrypt(&self, message: &[u8]) -> Option<Vec<u8>> {
         self.maybe_roll(UnixTime::now())?
             .current
@@ -141,12 +129,137 @@ impl ProducesTickets for TicketRotator {
                     .and_then(|previous| previous.decrypt(ciphertext))
             })
     }
+
+    fn lifetime(&self) -> Duration {
+        self.lifetime
+    }
 }
 
-#[cfg(feature = "std")]
 impl core::fmt::Debug for TicketRotator {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("TicketRotator")
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use core::time::Duration;
+
+    use pki_types::UnixTime;
+
+    use super::*;
+
+    #[test]
+    fn ticketrotator_switching_test() {
+        let t = TicketRotator::new(Duration::from_secs(1), FakeTicketer::new).unwrap();
+        let now = UnixTime::now();
+        let cipher1 = t.encrypt(b"ticket 1").unwrap();
+        assert_eq!(t.decrypt(&cipher1).unwrap(), b"ticket 1");
+        {
+            // Trigger new ticketer
+            t.maybe_roll(UnixTime::since_unix_epoch(Duration::from_secs(
+                now.as_secs() + 10,
+            )));
+        }
+        let cipher2 = t.encrypt(b"ticket 2").unwrap();
+        assert_eq!(t.decrypt(&cipher1).unwrap(), b"ticket 1");
+        assert_eq!(t.decrypt(&cipher2).unwrap(), b"ticket 2");
+        {
+            // Trigger new ticketer
+            t.maybe_roll(UnixTime::since_unix_epoch(Duration::from_secs(
+                now.as_secs() + 20,
+            )));
+        }
+        let cipher3 = t.encrypt(b"ticket 3").unwrap();
+        assert!(t.decrypt(&cipher1).is_none());
+        assert_eq!(t.decrypt(&cipher2).unwrap(), b"ticket 2");
+        assert_eq!(t.decrypt(&cipher3).unwrap(), b"ticket 3");
+    }
+
+    #[test]
+    fn ticketrotator_remains_usable_over_temporary_ticketer_creation_failure() {
+        let mut t = TicketRotator::new(Duration::from_secs(1), FakeTicketer::new).unwrap();
+        let now = UnixTime::now();
+        let cipher1 = t.encrypt(b"ticket 1").unwrap();
+        assert_eq!(t.decrypt(&cipher1).unwrap(), b"ticket 1");
+        t.generator = fail_generator;
+        {
+            // Failed new ticketer; this means we still need to
+            // rotate.
+            t.maybe_roll(UnixTime::since_unix_epoch(Duration::from_secs(
+                now.as_secs() + 10,
+            )));
+        }
+
+        // check post-failure encryption/decryption still works
+        let cipher2 = t.encrypt(b"ticket 2").unwrap();
+        assert_eq!(t.decrypt(&cipher1).unwrap(), b"ticket 1");
+        assert_eq!(t.decrypt(&cipher2).unwrap(), b"ticket 2");
+
+        // do the rotation for real
+        t.generator = FakeTicketer::new;
+        {
+            t.maybe_roll(UnixTime::since_unix_epoch(Duration::from_secs(
+                now.as_secs() + 20,
+            )));
+        }
+        let cipher3 = t.encrypt(b"ticket 3").unwrap();
+        assert!(t.decrypt(&cipher1).is_some());
+        assert_eq!(t.decrypt(&cipher2).unwrap(), b"ticket 2");
+        assert_eq!(t.decrypt(&cipher3).unwrap(), b"ticket 3");
+    }
+
+    #[derive(Debug)]
+    struct FakeTicketer {
+        gen: u8,
+    }
+
+    impl FakeTicketer {
+        #[expect(clippy::new_ret_no_self)]
+        fn new() -> Result<Box<dyn TicketProducer>, Error> {
+            Ok(Box::new(Self {
+                gen: std::dbg!(FAKE_GEN.fetch_add(1, Ordering::SeqCst)),
+            }))
+        }
+    }
+
+    impl TicketProducer for FakeTicketer {
+        fn encrypt(&self, message: &[u8]) -> Option<Vec<u8>> {
+            let mut v = Vec::with_capacity(1 + message.len());
+            v.push(self.gen);
+            v.extend(
+                message
+                    .iter()
+                    .copied()
+                    .map(|b| b ^ self.gen),
+            );
+            Some(v)
+        }
+
+        fn decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+            if ciphertext.first()? != &self.gen {
+                return None;
+            }
+
+            Some(
+                ciphertext[1..]
+                    .iter()
+                    .copied()
+                    .map(|b| b ^ self.gen)
+                    .collect(),
+            )
+        }
+
+        fn lifetime(&self) -> Duration {
+            Duration::ZERO // Left to the rotator
+        }
+    }
+
+    static FAKE_GEN: AtomicU8 = AtomicU8::new(0);
+
+    fn fail_generator() -> Result<Box<dyn TicketProducer>, Error> {
+        Err(Error::FailedToGetRandomBytes)
     }
 }

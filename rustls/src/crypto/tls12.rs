@@ -1,11 +1,11 @@
 use alloc::boxed::Box;
 
 use super::{ActiveKeyExchange, hmac};
+use crate::enums::ProtocolVersion;
 use crate::error::Error;
-use crate::version::TLS12;
 
 /// Implements [`Prf`] using a [`hmac::Hmac`].
-#[allow(clippy::exhaustive_structs)]
+#[expect(clippy::exhaustive_structs)]
 pub struct PrfUsingHmac<'a>(pub &'a dyn hmac::Hmac);
 
 impl Prf for PrfUsingHmac<'_> {
@@ -21,7 +21,7 @@ impl Prf for PrfUsingHmac<'_> {
             output,
             self.0
                 .with_key(
-                    kx.complete_for_tls_version(peer_pub_key, &TLS12)?
+                    kx.complete_for_tls_version(peer_pub_key, ProtocolVersion::TLSv1_2)?
                         .secret_bytes(),
                 )
                 .as_ref(),
@@ -108,6 +108,31 @@ pub(crate) fn prf(out: &mut [u8], hmac_key: &dyn hmac::Key, label: &[u8], seed: 
         chunk.copy_from_slice(&p_term.as_ref()[..chunk.len()]);
 
         previous_a = Some(a_i);
+    }
+}
+
+#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
+pub(crate) struct FakePrf;
+
+#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
+impl Prf for FakePrf {
+    fn for_key_exchange(
+        &self,
+        _: &mut [u8; 48],
+        _: Box<dyn ActiveKeyExchange>,
+        _: &[u8],
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<(), Error> {
+        todo!()
+    }
+
+    fn new_secret(&self, _: &[u8; 48]) -> Box<dyn PrfSecret> {
+        todo!()
+    }
+
+    fn fips(&self) -> bool {
+        false
     }
 }
 

@@ -7,7 +7,7 @@ use std::io;
 use std::io::Read;
 
 #[cfg(feature = "std")]
-use crate::msgs::message::OutboundChunks;
+use crate::crypto::cipher::OutboundChunks;
 
 /// This is a byte buffer that is built from a deque of byte vectors.
 ///
@@ -113,7 +113,7 @@ impl ChunkVecBuffer {
 impl ChunkVecBuffer {
     pub(crate) fn is_full(&self) -> bool {
         self.limit
-            .map(|limit| self.len() > limit)
+            .map(|limit| self.len() >= limit)
             .unwrap_or_default()
     }
 

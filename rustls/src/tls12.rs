@@ -8,17 +8,16 @@ use zeroize::Zeroizing;
 use crate::common_state::{CommonState, Protocol, Side};
 use crate::conn::{ConnectionRandoms, Exporter};
 use crate::crypto::cipher::{AeadKey, MessageDecrypter, MessageEncrypter, Tls12AeadAlgorithm};
-use crate::crypto::hash;
-use crate::enums::{AlertDescription, SignatureScheme};
-use crate::error::{Error, InvalidMessage};
+use crate::crypto::{self, hash};
+use crate::enums::{AlertDescription, ProtocolVersion, SignatureScheme};
+use crate::error::{ApiMisuse, Error, InvalidMessage};
 use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::handshake::{KeyExchangeAlgorithm, KxDecode};
-use crate::suites::{CipherSuiteCommon, PartiallyExtractedSecrets, SupportedCipherSuite};
+use crate::suites::{CipherSuiteCommon, PartiallyExtractedSecrets, Suite, SupportedCipherSuite};
 use crate::version::Tls12Version;
-use crate::{SignatureAlgorithm, crypto};
 
 /// A TLS 1.2 cipher suite supported by rustls.
-#[allow(clippy::exhaustive_structs)]
+#[expect(clippy::exhaustive_structs)]
 pub struct Tls12CipherSuite {
     /// Common cipher suite fields.
     pub common: CipherSuiteCommon,
@@ -83,26 +82,42 @@ impl Tls12CipherSuite {
     pub fn fips(&self) -> bool {
         self.common.fips() && self.prf_provider.fips() && self.aead_alg.fips()
     }
+}
+
+impl Suite for Tls12CipherSuite {
+    fn client_handler(&self) -> &'static dyn crate::client::ClientHandler<Self> {
+        self.protocol_version.client
+    }
+
+    fn server_handler(&self) -> &'static dyn crate::server::ServerHandler<Self> {
+        self.protocol_version.server
+    }
 
     /// Does this suite support the `proto` protocol?
     ///
     /// All TLS1.2 suites support TCP-TLS. No TLS1.2 suites support QUIC.
-    pub(crate) fn usable_for_protocol(&self, proto: Protocol) -> bool {
+    fn usable_for_protocol(&self, proto: Protocol) -> bool {
         matches!(proto, Protocol::Tcp)
+    }
+
+    /// Say if the given `KeyExchangeAlgorithm` is supported by this cipher suite.
+    fn usable_for_kx_algorithm(&self, kxa: KeyExchangeAlgorithm) -> bool {
+        self.kx == kxa
     }
 
     /// Return true if this suite is usable for a key only offering `sig_alg`
     /// signatures.
-    pub(crate) fn usable_for_signature_algorithm(&self, sig_alg: SignatureAlgorithm) -> bool {
+    fn usable_for_signature_scheme(&self, scheme: SignatureScheme) -> bool {
         self.sign
             .iter()
-            .any(|scheme| scheme.algorithm() == sig_alg)
+            .any(|s| s.algorithm() == scheme.algorithm())
     }
 
-    /// Say if the given `KeyExchangeAlgorithm` is supported by this cipher suite.
-    pub(crate) fn usable_for_kx_algorithm(&self, kxa: KeyExchangeAlgorithm) -> bool {
-        self.kx == kxa
+    fn common(&self) -> &CipherSuiteCommon {
+        &self.common
     }
+
+    const VERSION: ProtocolVersion = ProtocolVersion::TLSv1_2;
 }
 
 impl From<&'static Tls12CipherSuite> for SupportedCipherSuite {
@@ -332,7 +347,7 @@ impl Exporter for Tls12Exporter {
         if let Some(context) = context {
             match u16::try_from(context.len()) {
                 Ok(len) => len.encode(&mut randoms),
-                Err(_) => return Err(Error::General("excess context length".into())),
+                Err(_) => return Err(ApiMisuse::ExporterContextTooLong.into()),
             }
             randoms.extend_from_slice(context);
         }
@@ -388,30 +403,37 @@ pub(crate) fn decode_kx_params<'a, T: KxDecode<'a>>(
 pub(crate) const DOWNGRADE_SENTINEL: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x01];
 
 #[cfg(test)]
-#[macro_rules_attribute::apply(test_for_each_provider)]
 mod tests {
-    use super::provider::kx_group::X25519;
     use super::*;
     use crate::common_state::{CommonState, Side};
     use crate::msgs::handshake::{ServerEcdhParams, ServerKeyExchangeParams};
+    use crate::{NamedGroup, TEST_PROVIDERS};
 
     #[test]
     fn server_ecdhe_remaining_bytes() {
-        let key = X25519.start().unwrap();
-        let server_params = ServerEcdhParams::new(&*key);
-        let mut server_buf = Vec::new();
-        server_params.encode(&mut server_buf);
-        server_buf.push(34);
+        for provider in TEST_PROVIDERS {
+            let Some(kx_group) =
+                provider.find_kx_group(NamedGroup::X25519, ProtocolVersion::TLSv1_3)
+            else {
+                continue;
+            };
 
-        let mut common = CommonState::new(Side::Client);
-        assert!(
-            decode_kx_params::<ServerKeyExchangeParams>(
-                KeyExchangeAlgorithm::ECDHE,
-                &mut common,
-                &server_buf
-            )
-            .is_err()
-        );
+            let key = kx_group.start().unwrap();
+            let server_params = ServerEcdhParams::new(&*key);
+            let mut server_buf = Vec::new();
+            server_params.encode(&mut server_buf);
+            server_buf.push(34);
+
+            let mut common = CommonState::new(Side::Client);
+            assert!(
+                decode_kx_params::<ServerKeyExchangeParams>(
+                    KeyExchangeAlgorithm::ECDHE,
+                    &mut common,
+                    &server_buf
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

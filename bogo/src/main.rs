@@ -11,7 +11,6 @@
     clippy::use_self,
     clippy::upper_case_acronyms,
     elided_lifetimes_in_paths,
-    trivial_casts,
     trivial_numeric_casts,
     unreachable_pub,
     unused_import_braces,
@@ -20,6 +19,7 @@
 )]
 
 use core::fmt::{Debug, Formatter};
+use std::borrow::Cow;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::{env, net, process, thread, time};
@@ -30,32 +30,33 @@ use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
 use rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier, ServerIdentity,
+    HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
 };
 use rustls::client::{
-    ClientConfig, ClientConnection, EchConfig, EchGreaseConfig, EchMode, EchStatus, Resumption,
-    Tls12Resumption, WebPkiServerVerifier,
+    self, ClientConfig, ClientConnection, CredentialRequest, EchConfig, EchGreaseConfig, EchMode,
+    EchStatus, Resumption, Tls12Resumption, WebPkiServerVerifier,
 };
 use rustls::crypto::aws_lc_rs::hpke;
 use rustls::crypto::hpke::{Hpke, HpkePublicKey};
-use rustls::crypto::{CryptoProvider, aws_lc_rs, ring};
+use rustls::crypto::{
+    Credentials, CryptoProvider, Identity, SelectedCredential, Signer, SigningKey,
+    SingleCredential, aws_lc_rs, ring,
+};
+use rustls::enums::{
+    AlertDescription, CertificateCompressionAlgorithm, CertificateType, ProtocolVersion,
+    SignatureScheme,
+};
+use rustls::error::{CertificateError, Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
 use rustls::internal::msgs::codec::Codec;
 use rustls::internal::msgs::persist::ServerSessionValue;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{
     CertificateDer, EchConfigListBytes, PrivateKeyDer, ServerName, SubjectPublicKeyInfoDer,
 };
-use rustls::server::danger::{
-    ClientCertVerified, ClientCertVerifier, ClientIdentity, SignatureVerificationInput,
-};
-use rustls::server::{
-    ClientHello, ProducesTickets, ServerConfig, ServerConnection, WebPkiClientVerifier,
-};
+use rustls::server::danger::{ClientIdentity, ClientVerifier, SignatureVerificationInput};
+use rustls::server::{self, ClientHello, ServerConfig, ServerConnection, WebPkiClientVerifier};
 use rustls::{
-    AlertDescription, CertificateCompressionAlgorithm, CertificateError, Connection,
-    DistinguishedName, Error, HandshakeKind, InvalidMessage, NamedGroup, PeerIncompatible,
-    PeerMisbehaved, ProtocolVersion, RootCertStore, Side, SignatureAlgorithm, SignatureScheme,
-    client, compress, server, sign,
+    Connection, DistinguishedName, HandshakeKind, NamedGroup, RootCertStore, Side, compress,
 };
 
 static BOGO_NACK: i32 = 89;
@@ -89,14 +90,14 @@ struct Options {
     host_name: String,
     use_sni: bool,
     trusted_cert_file: String,
-    credentials: Credentials,
+    credentials: CredentialSet,
     protocols: Vec<String>,
     reject_alpn: bool,
     support_tls13: bool,
     support_tls12: bool,
     min_version: Option<ProtocolVersion>,
     max_version: Option<ProtocolVersion>,
-    server_ocsp_response: Vec<u8>,
+    server_ocsp_response: Arc<[u8]>,
     groups: Option<Vec<NamedGroup>>,
     export_keying_material: usize,
     export_keying_material_label: String,
@@ -159,14 +160,14 @@ impl Options {
             root_hint_subjects: vec![],
             offer_no_client_cas: false,
             trusted_cert_file: "".to_string(),
-            credentials: Credentials::default(),
+            credentials: CredentialSet::default(),
             protocols: vec![],
             reject_alpn: false,
             support_tls13: true,
             support_tls12: true,
             min_version: None,
             max_version: None,
-            server_ocsp_response: vec![],
+            server_ocsp_response: Arc::from([]),
             groups: None,
             export_keying_material: 0,
             export_keying_material_label: "".to_string(),
@@ -225,27 +226,34 @@ impl Options {
         if let Some(groups) = &self.groups {
             provider
                 .kx_groups
+                .to_mut()
                 .retain(|kxg| groups.contains(&kxg.name()));
         }
 
         match (self.tls12_supported(), self.tls13_supported()) {
             (true, true) => provider,
-            (true, false) => provider.with_only_tls12(),
-            (false, true) => provider.with_only_tls13(),
+            (true, false) => CryptoProvider {
+                tls13_cipher_suites: Default::default(),
+                ..provider
+            },
+            (false, true) => CryptoProvider {
+                tls12_cipher_suites: Default::default(),
+                ..provider
+            },
             _ => panic!("nonsense version constraint"),
         }
     }
 }
 
 #[derive(Debug, Default)]
-struct Credentials {
+struct CredentialSet {
     default: Credential,
     additional: Vec<Credential>,
     /// Some(-1) means `default`, otherwise index into `additional`
     expect_selected: Option<isize>,
 }
 
-impl Credentials {
+impl CredentialSet {
     fn last_mut(&mut self) -> &mut Credential {
         self.additional
             .last_mut()
@@ -270,13 +278,18 @@ struct Credential {
 }
 
 impl Credential {
-    fn load_from_file(&self) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    fn load_from_file(&self, provider: &CryptoProvider) -> Credentials {
         let certs = CertificateDer::pem_file_iter(&self.cert_file)
             .unwrap()
             .map(|cert| cert.unwrap())
             .collect::<Vec<_>>();
         let key = PrivateKeyDer::from_pem_file(&self.key_file).unwrap();
-        (certs, key)
+        Credentials::from_der(
+            Arc::from(Identity::from_cert_chain(certs).unwrap()),
+            key,
+            provider,
+        )
+        .unwrap()
     }
 
     fn configured(&self) -> bool {
@@ -302,7 +315,7 @@ impl SelectedProvider {
             #[cfg(feature = "fips")]
             Some("aws-lc-rs-fips") => Self::AwsLcRsFips,
             Some("ring") => Self::Ring,
-            Some(other) => panic!("unrecognised value for BOGO_SHIM_PROVIDER: {other:?}"),
+            Some(other) => panic!("unrecognized value for BOGO_SHIM_PROVIDER: {other:?}"),
         }
     }
 
@@ -314,21 +327,14 @@ impl SelectedProvider {
                 // this includes rustls-post-quantum, which just returns an altered
                 // version of `aws_lc_rs::default_provider()`
                 CryptoProvider {
-                    kx_groups: aws_lc_rs::DEFAULT_KX_GROUPS.to_vec(),
-                    tls12_cipher_suites: aws_lc_rs::ALL_TLS12_CIPHER_SUITES.to_vec(),
-                    tls13_cipher_suites: aws_lc_rs::ALL_TLS13_CIPHER_SUITES.to_vec(),
-                    ..aws_lc_rs::default_provider()
+                    kx_groups: Cow::Borrowed(aws_lc_rs::ALL_KX_GROUPS),
+                    tls12_cipher_suites: Cow::Borrowed(aws_lc_rs::ALL_TLS12_CIPHER_SUITES),
+                    tls13_cipher_suites: Cow::Borrowed(aws_lc_rs::ALL_TLS13_CIPHER_SUITES),
+                    ..aws_lc_rs::DEFAULT_PROVIDER
                 }
             }
 
-            Self::Ring => ring::default_provider(),
-        }
-    }
-
-    fn ticketer(&self) -> Arc<dyn ProducesTickets> {
-        match self {
-            Self::AwsLcRs | Self::AwsLcRsFips => aws_lc_rs::Ticketer::new().unwrap(),
-            Self::Ring => ring::Ticketer::new().unwrap(),
+            Self::Ring => ring::DEFAULT_PROVIDER,
         }
     }
 
@@ -388,7 +394,7 @@ fn decode_hex(hex: &str) -> Vec<u8> {
 struct DummyClientAuth {
     mandatory: bool,
     root_hint_subjects: Arc<[DistinguishedName]>,
-    parent: Arc<dyn ClientCertVerifier>,
+    parent: Arc<dyn ClientVerifier>,
 }
 
 impl DummyClientAuth {
@@ -400,11 +406,9 @@ impl DummyClientAuth {
         Self {
             mandatory,
             root_hint_subjects,
-            parent: WebPkiClientVerifier::builder_with_provider(
+            parent: WebPkiClientVerifier::builder(
                 load_root_certs(trusted_cert_file),
-                SelectedProvider::from_env()
-                    .provider()
-                    .into(),
+                &SelectedProvider::from_env().provider(),
             )
             .build()
             .unwrap(),
@@ -412,24 +416,9 @@ impl DummyClientAuth {
     }
 }
 
-impl ClientCertVerifier for DummyClientAuth {
-    fn offer_client_auth(&self) -> bool {
-        true
-    }
-
-    fn client_auth_mandatory(&self) -> bool {
-        self.mandatory
-    }
-
-    fn root_hint_subjects(&self) -> Arc<[DistinguishedName]> {
-        self.root_hint_subjects.clone()
-    }
-
-    fn verify_client_cert(
-        &self,
-        _identity: &ClientIdentity<'_>,
-    ) -> Result<ClientCertVerified, Error> {
-        Ok(ClientCertVerified::assertion())
+impl ClientVerifier for DummyClientAuth {
+    fn verify_identity(&self, _identity: &ClientIdentity<'_>) -> Result<PeerVerified, Error> {
+        Ok(PeerVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -448,6 +437,18 @@ impl ClientCertVerifier for DummyClientAuth {
             .verify_tls13_signature(input)
     }
 
+    fn root_hint_subjects(&self) -> Arc<[DistinguishedName]> {
+        self.root_hint_subjects.clone()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.mandatory
+    }
+
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.parent.supported_verify_schemes()
     }
@@ -455,18 +456,16 @@ impl ClientCertVerifier for DummyClientAuth {
 
 #[derive(Debug)]
 struct DummyServerAuth {
-    parent: Arc<dyn ServerCertVerifier>,
+    parent: Arc<dyn ServerVerifier>,
     ocsp: OcspValidation,
 }
 
 impl DummyServerAuth {
     fn new(trusted_cert_file: &str, ocsp: OcspValidation) -> Self {
         Self {
-            parent: WebPkiServerVerifier::builder_with_provider(
+            parent: WebPkiServerVerifier::builder(
                 load_root_certs(trusted_cert_file),
-                SelectedProvider::from_env()
-                    .provider()
-                    .into(),
+                &SelectedProvider::from_env().provider(),
             )
             .build()
             .unwrap(),
@@ -475,15 +474,12 @@ impl DummyServerAuth {
     }
 }
 
-impl ServerCertVerifier for DummyServerAuth {
-    fn verify_server_cert(
-        &self,
-        _identity: &ServerIdentity<'_>,
-    ) -> Result<ServerCertVerified, Error> {
+impl ServerVerifier for DummyServerAuth {
+    fn verify_identity(&self, _identity: &ServerIdentity<'_>) -> Result<PeerVerified, Error> {
         if let OcspValidation::Reject = self.ocsp {
             return Err(CertificateError::InvalidOcspResponse.into());
         }
-        Ok(ServerCertVerified::assertion())
+        Ok(PeerVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -523,12 +519,12 @@ enum OcspValidation {
 
 #[derive(Debug)]
 struct FixedSignatureSchemeSigningKey {
-    key: Arc<dyn sign::SigningKey>,
+    key: Box<dyn SigningKey>,
     scheme: SignatureScheme,
 }
 
-impl sign::SigningKey for FixedSignatureSchemeSigningKey {
-    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn sign::Signer>> {
+impl SigningKey for FixedSignatureSchemeSigningKey {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
         if offered.contains(&self.scheme) {
             self.key.choose_scheme(&[self.scheme])
         } else {
@@ -539,26 +535,30 @@ impl sign::SigningKey for FixedSignatureSchemeSigningKey {
     fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
         self.key.public_key()
     }
-
-    fn algorithm(&self) -> SignatureAlgorithm {
-        self.key.algorithm()
-    }
 }
 
 #[derive(Debug)]
 struct FixedSignatureSchemeServerCertResolver {
-    resolver: Arc<dyn server::ResolvesServerCert>,
+    credentials: Credentials,
     scheme: SignatureScheme,
 }
 
-impl server::ResolvesServerCert for FixedSignatureSchemeServerCertResolver {
-    fn resolve(&self, client_hello: &ClientHello<'_>) -> Option<Arc<sign::CertifiedKey>> {
-        let mut certkey = self.resolver.resolve(client_hello)?;
-        Arc::make_mut(&mut certkey).key = Arc::new(FixedSignatureSchemeSigningKey {
-            key: certkey.key.clone(),
-            scheme: self.scheme,
-        });
-        Some(certkey)
+impl server::ServerCredentialResolver for FixedSignatureSchemeServerCertResolver {
+    fn resolve(&self, client_hello: &ClientHello<'_>) -> Result<SelectedCredential, Error> {
+        if !client_hello
+            .signature_schemes()
+            .contains(&self.scheme)
+        {
+            return Err(Error::PeerIncompatible(
+                PeerIncompatible::NoSignatureSchemesInCommon,
+            ));
+        }
+
+        self.credentials
+            .signer(&[self.scheme])
+            .ok_or(Error::PeerIncompatible(
+                PeerIncompatible::NoSignatureSchemesInCommon,
+            ))
     }
 }
 
@@ -570,57 +570,45 @@ struct MultipleClientCredentialResolver {
 }
 
 impl MultipleClientCredentialResolver {
-    fn add(&mut self, key: sign::CertifiedKey, meta: &Credential) {
+    fn add(&mut self, key: Credentials, meta: &Credential) {
         self.additional
             .push(ClientCert::new(key, meta));
     }
 
-    fn set_default(&mut self, key: sign::CertifiedKey, meta: &Credential) {
+    fn set_default(&mut self, key: Credentials, meta: &Credential) {
         self.default = Some(ClientCert::new(key, meta));
     }
 }
 
-impl client::ResolvesClientCert for MultipleClientCredentialResolver {
-    fn resolve(
-        &self,
-        root_hint_subjects: &[&[u8]],
-        sig_schemes: &[SignatureScheme],
-    ) -> Option<Arc<sign::CertifiedKey>> {
+impl client::ClientCredentialResolver for MultipleClientCredentialResolver {
+    fn resolve(&self, request: &CredentialRequest<'_>) -> Option<SelectedCredential> {
         // `sig_schemes` is in server preference order, so respect that.
+        let sig_schemes = request.signature_schemes();
+        let root_hint_subjects = request.root_hint_subjects();
         for sig_scheme in sig_schemes.iter().copied() {
             for (i, cert) in self.additional.iter().enumerate() {
                 // if the server sends any issuer hints, respect them
                 if cert.must_match_issuer
                     && !root_hint_subjects
                         .iter()
-                        .any(|dn| *dn == cert.issuer_dn.as_ref())
+                        .any(|dn| dn.as_ref() == cert.issuer_dn.as_ref())
                 {
                     continue;
                 }
 
-                if cert
-                    .certkey
-                    .key
-                    .choose_scheme(&[sig_scheme])
-                    .is_some()
-                {
+                if let Some(signer) = cert.certkey.signer(&[sig_scheme]) {
                     assert!(
                         Some(i as isize) == self.expect_selected || self.expect_selected.is_none()
                     );
-                    return Some(cert.certkey.clone());
+                    return Some(signer);
                 }
             }
         }
 
         if let Some(cert) = &self.default {
-            if cert
-                .certkey
-                .key
-                .choose_scheme(sig_schemes)
-                .is_some()
-            {
+            if let Some(signer) = cert.certkey.signer(sig_schemes) {
                 assert!(matches!(self.expect_selected, Some(-1) | None));
-                return Some(cert.certkey.clone());
+                return Some(signer);
             }
         }
 
@@ -638,33 +626,43 @@ impl client::ResolvesClientCert for MultipleClientCredentialResolver {
         })
     }
 
-    fn has_certs(&self) -> bool {
-        self.default.is_some() || !self.additional.is_empty()
+    fn supported_certificate_types(&self) -> &'static [CertificateType] {
+        match self.default.is_some() || !self.additional.is_empty() {
+            true => &[CertificateType::X509],
+            false => &[],
+        }
     }
 }
 
 #[derive(Debug)]
 struct ClientCert {
-    certkey: Arc<sign::CertifiedKey>,
+    certkey: Credentials,
     issuer_dn: DistinguishedName,
     must_match_issuer: bool,
 }
 
 impl ClientCert {
-    fn new(mut certkey: sign::CertifiedKey, meta: &Credential) -> Self {
-        let parsed_cert =
-            webpki::EndEntityCert::try_from(certkey.cert_chain.last().unwrap()).unwrap();
+    fn new(mut certkey: Credentials, meta: &Credential) -> Self {
+        let Identity::X509(id) = &*certkey.identity else {
+            panic!("only X.509 client certs supported");
+        };
+
+        let parsed_cert = webpki::EndEntityCert::try_from(match id.intermediates.last() {
+            Some(root) => root,
+            None => &id.end_entity,
+        })
+        .unwrap();
         let issuer_dn = DistinguishedName::in_sequence(parsed_cert.issuer());
 
         if let Some(scheme) = meta.use_signing_scheme {
-            certkey.key = Arc::new(FixedSignatureSchemeSigningKey {
+            certkey.key = Box::new(FixedSignatureSchemeSigningKey {
                 key: certkey.key,
                 scheme: lookup_scheme(scheme),
             });
         }
 
         Self {
-            certkey: Arc::new(certkey),
+            certkey,
             issuer_dn,
             must_match_issuer: meta.must_match_issuer,
         }
@@ -773,11 +771,21 @@ fn make_server_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ServerConfi
         "TODO: server certificate switching not implemented yet"
     );
     let cred = &opts.credentials.default;
-    let (certs, key) = cred.load_from_file();
+    let provider = opts.provider();
+    let mut credentials = cred.load_from_file(&provider);
+    credentials.ocsp = Some(opts.server_ocsp_response.clone());
 
-    let mut cfg = ServerConfig::builder_with_provider(opts.provider().into())
+    let cert_resolver = match cred.use_signing_scheme {
+        Some(scheme) => Arc::new(FixedSignatureSchemeServerCertResolver {
+            credentials,
+            scheme: lookup_scheme(scheme),
+        }) as Arc<dyn server::ServerCredentialResolver>,
+        None => Arc::new(SingleCredential::from(credentials)),
+    };
+
+    let mut cfg = ServerConfig::builder(Arc::new(provider))
         .with_client_cert_verifier(client_auth)
-        .with_single_cert_with_ocsp(certs, key, opts.server_ocsp_response.clone())
+        .with_server_credential_resolver(cert_resolver)
         .unwrap();
 
     cfg.session_storage = ServerCacheWithResumptionDelay::new(opts.resumption_delay);
@@ -789,16 +797,13 @@ fn make_server_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ServerConfi
         cfg.key_log = key_log.clone();
     }
 
-    if let Some(scheme) = cred.use_signing_scheme {
-        let scheme = lookup_scheme(scheme);
-        cfg.cert_resolver = Arc::new(FixedSignatureSchemeServerCertResolver {
-            resolver: cfg.cert_resolver.clone(),
-            scheme,
-        });
-    }
-
     if opts.tickets {
-        cfg.ticketer = opts.selected_provider.ticketer();
+        cfg.ticketer = Some(
+            cfg.crypto_provider()
+                .ticketer_factory
+                .ticketer()
+                .unwrap(),
+        );
     } else if opts.resumes == 0 {
         cfg.session_storage = Arc::new(server::NoServerSessionStorage {});
     }
@@ -910,10 +915,16 @@ impl Debug for ClientCacheWithoutKxHints {
 
 fn make_client_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ClientConfig> {
     let provider = Arc::new(opts.provider());
-    let cfg = ClientConfig::builder_with_provider(provider.clone());
+    let cfg = ClientConfig::builder(provider.clone());
 
     let cfg = if opts.selected_provider.supports_ech() {
-        let ech_cfg = ClientConfig::builder_with_provider(opts.provider().with_only_tls13().into());
+        let ech_cfg = ClientConfig::builder(
+            CryptoProvider {
+                tls12_cipher_suites: Default::default(),
+                ..opts.provider()
+            }
+            .into(),
+        );
 
         if let Some(ech_config_list) = &opts.ech_config_list {
             let ech_mode: EchMode = EchConfig::new(ech_config_list.clone(), ALL_HPKE_SUITES)
@@ -951,32 +962,14 @@ fn make_client_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ClientConfi
 
             if opts.credentials.default.configured() {
                 let cred = &opts.credentials.default;
-                let (certs, key) = cred.load_from_file();
-                let key = provider
-                    .key_provider
-                    .load_private_key(key)
-                    .expect("cannot load private key");
-
-                resolver.set_default(
-                    sign::CertifiedKey::new(certs, key).expect("keys match"),
-                    cred,
-                )
+                resolver.set_default(cred.load_from_file(&provider), cred)
             }
 
             for cred in opts.credentials.additional.iter() {
-                let (certs, key) = cred.load_from_file();
-                let key = provider
-                    .key_provider
-                    .load_private_key(key)
-                    .expect("cannot load private key");
-
-                resolver.add(
-                    sign::CertifiedKey::new(certs, key).expect("keys match"),
-                    cred,
-                );
+                resolver.add(cred.load_from_file(&provider), cred);
             }
 
-            cfg.with_client_cert_resolver(Arc::new(resolver))
+            cfg.with_client_credential_resolver(Arc::new(resolver))
                 .unwrap()
         }
         false => cfg.with_no_client_auth().unwrap(),
@@ -1107,6 +1100,9 @@ fn handle_err(opts: &Options, err: Error) -> ! {
             }
             quit(":ECH_REJECTED:")
         }
+        Error::PeerIncompatible(PeerIncompatible::NoCipherSuitesInCommon) => {
+            quit(":NO_SHARED_CIPHER:")
+        }
         Error::PeerIncompatible(_) => quit(":INCOMPATIBLE:"),
         Error::PeerMisbehaved(PeerMisbehaved::MissingPskModesExtension) => {
             quit(":MISSING_EXTENSION:")
@@ -1136,6 +1132,19 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         Error::PeerMisbehaved(PeerMisbehaved::TooManyKeyUpdateRequests) => {
             quit(":TOO_MANY_KEY_UPDATES:")
         }
+        Error::PeerMisbehaved(PeerMisbehaved::MissingKeyShare) => quit(":MISSING_KEY_SHARE:"),
+        Error::PeerMisbehaved(PeerMisbehaved::OfferedDuplicateKeyShares) => {
+            quit(":DUPLICATE_KEY_SHARE:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::IllegalMiddleboxChangeCipherSpec) => {
+            quit(":ILLEGAL_MIDDLEBOX_CHANGE_CIPHER_SPEC:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::EarlyDataExtensionWithoutResumption) => {
+            quit(":UNEXPECTED_EXTENSION:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::EarlyDataOfferedWithVariedCipherSuite) => {
+            quit(":CIPHER_MISMATCH_ON_EARLY_DATA:")
+        }
         Error::PeerMisbehaved(PeerMisbehaved::ServerEchoedCompatibilitySessionId) => {
             quit(":SERVER_ECHOED_INVALID_SESSION_ID:")
         }
@@ -1146,16 +1155,41 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         | Error::PeerMisbehaved(PeerMisbehaved::UnsolicitedEchExtension) => {
             quit(":UNEXPECTED_EXTENSION:")
         }
-        // The TLS-ECH-Client-UnsolicitedInnerServerNameAck test is expected to fail with
-        // :UNEXPECTED_EXTENSION: when we receive an unsolicited inner hello SNI extension.
-        // We treat this the same as any unexpected enc'd ext and return :PEER_MISBEHAVIOUR:.
-        // Convert to the expected if this error occurs when we're configured w/ ECH.
-        Error::PeerMisbehaved(PeerMisbehaved::UnsolicitedEncryptedExtension)
-            if opts.ech_config_list.is_some() =>
-        {
-            quit(":UNEXPECTED_EXTENSION:")
+        Error::PeerMisbehaved(
+            PeerMisbehaved::UnsolicitedEncryptedExtension
+            | PeerMisbehaved::UnsolicitedServerHelloExtension
+            | PeerMisbehaved::UnexpectedCleartextExtension
+            | PeerMisbehaved::UnsolicitedCertExtension,
+        ) => quit(":UNEXPECTED_EXTENSION:"),
+        Error::PeerMisbehaved(PeerMisbehaved::DisallowedEncryptedExtension) => {
+            quit(":ERROR_PARSING_EXTENSION:")
         }
+        Error::PeerMisbehaved(PeerMisbehaved::IllegalHelloRetryRequestWithOfferedGroup) => {
+            quit(":ILLEGAL_HELLO_RETRY_REQUEST_WITH_OFFERED_GROUP:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::IllegalHelloRetryRequestWithUnofferedNamedGroup) => {
+            quit(":ILLEGAL_HELLO_RETRY_REQUEST_WITH_UNOFFERED_GROUP:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::IllegalHelloRetryRequestWithNoChanges) => {
+            quit(":EMPTY_HELLO_RETRY_REQUEST:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::DuplicateHelloRetryRequestExtensions) => {
+            quit(":DUPLICATE_HELLO_RETRY_REQUEST_EXTENSIONS:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::SelectedTls12UsingTls13VersionExtension) => {
+            quit(":SELECTED_TLS12_USING_TLS13_VERSION_EXTENSION:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::OfferedIncorrectCompressions) => {
+            quit(":INVALID_COMPRESSION_LIST:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::SelectedUnofferedCompression) => {
+            quit(":UNSUPPORTED_COMPRESSION_ALGORITHM:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::WrongGroupForKeyShare) => quit(":WRONG_CURVE:"),
         Error::PeerMisbehaved(PeerMisbehaved::SelectedUnofferedKxGroup) => quit(":WRONG_CURVE:"),
+        Error::PeerMisbehaved(PeerMisbehaved::RefusedToFollowHelloRetryRequest) => {
+            quit(":WRONG_CURVE:")
+        }
         Error::PeerMisbehaved(PeerMisbehaved::InvalidKeyShare) => quit(":BAD_ECPOINT:"),
         Error::PeerMisbehaved(PeerMisbehaved::MessageInterleavedWithHandshakeMessage) => {
             quit(":UNEXPECTED_MESSAGE:")
@@ -1163,8 +1197,48 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         Error::PeerMisbehaved(PeerMisbehaved::KeyEpochWithPendingFragment) => {
             quit(":EXCESS_HANDSHAKE_DATA:")
         }
-        Error::PeerMisbehaved(_) => quit(":PEER_MISBEHAVIOUR:"),
-        Error::NoCertificatesPresented => quit(":NO_CERTS:"),
+        Error::PeerMisbehaved(PeerMisbehaved::NoCertificatesPresented) => quit(":NO_CERTS:"),
+        Error::PeerMisbehaved(PeerMisbehaved::OfferedEarlyDataWithOldProtocolVersion) => {
+            quit(":WRONG_VERSION_ON_EARLY_DATA:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::SelectedUnofferedApplicationProtocol) => {
+            quit(":INVALID_ALPN_PROTOCOL:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::SelectedDifferentCipherSuiteAfterRetry) => {
+            quit(":SELECTED_DIFFERENT_CIPHERSUITE_AFTER_RETRY:")
+        }
+        Error::PeerMisbehaved(
+            PeerMisbehaved::ResumptionAttemptedWithVariedEms
+            | PeerMisbehaved::ResumptionOfferedWithVariedEms,
+        ) => quit(":RESUMED_SESSION_WITH_VARIED_EMS:"),
+        Error::PeerMisbehaved(PeerMisbehaved::IllegalTlsInnerPlaintext) => {
+            quit(":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::SelectedInvalidPsk) => {
+            quit(":PSK_IDENTITY_NOT_FOUND:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::PskExtensionWithMismatchedIdsAndBinders) => {
+            quit(":PSK_IDENTITY_BINDER_COUNT_MISMATCH:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::ResumptionOfferedWithIncompatibleCipherSuite) => {
+            quit(":OLD_SESSION_PRF_HASH_MISMATCH:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::PskExtensionMustBeLast) => {
+            quit(":PRE_SHARED_KEY_MUST_BE_LAST:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::IncorrectBinder) => {
+            quit(":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::ServerHelloMustOfferUncompressedEcPoints) => {
+            quit(":SERVER_HELLO_MUST_OFFER_UNCOMPRESSED_EC_POINTS:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::AttemptedDowngradeToTls12WhenTls13IsSupported) => {
+            quit(":TLS13_DOWNGRADE:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::RejectedEarlyDataInterleavedWithHandshakeMessage) => {
+            quit(":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:")
+        }
+        Error::PeerMisbehaved(_) => panic!("!!! please add error mapping for {err:?}"),
         Error::AlertReceived(AlertDescription::UnexpectedMessage) => quit(":BAD_ALERT:"),
         Error::AlertReceived(AlertDescription::DecompressionFailure) => {
             quit_err(":SSLV3_ALERT_DECOMPRESSION_FAILURE:")
@@ -1173,11 +1247,9 @@ fn handle_err(opts: &Options, err: Error) -> ! {
             quit(":CANNOT_PARSE_LEAF_CERT:")
         }
         Error::InvalidCertificate(CertificateError::BadSignature) => quit(":BAD_SIGNATURE:"),
-        #[allow(deprecated)]
         Error::InvalidCertificate(
-            CertificateError::UnsupportedSignatureAlgorithm
-            | CertificateError::UnsupportedSignatureAlgorithmContext { .. }
-            | CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext { .. },
+            CertificateError::UnsupportedSignatureAlgorithm { .. }
+            | CertificateError::UnsupportedSignatureAlgorithmForPublicKey { .. },
         ) => quit(":WRONG_SIGNATURE_TYPE:"),
         Error::InvalidCertificate(CertificateError::InvalidOcspResponse) => {
             // note: only use is in this file.
@@ -1455,7 +1527,10 @@ fn exec(opts: &Options, mut sess: Connection, key_log: &KeyLogMemo, count: usize
 
         if let Some(curve_id) = &opts.on_resume_expect_curve_id {
             if !sess.is_handshaking() && count > 0 {
-                assert_eq!(sess.handshake_kind().unwrap(), HandshakeKind::Resumed);
+                assert!(matches!(
+                    sess.handshake_kind().unwrap(),
+                    HandshakeKind::Resumed | HandshakeKind::ResumedWithHelloRetryRequest
+                ));
                 assert_eq!(
                     sess.negotiated_key_exchange_group()
                         .expect("no kx with -on-resume-expect-curve-id")
@@ -1643,8 +1718,6 @@ pub fn main() {
             "-expect-signed-cert-timestamps" |
             "-expect-certificate-types" |
             "-expect-client-ca-list" |
-            "-on-retry-expect-early-data-reason" |
-            "-on-resume-expect-early-data-reason" |
             "-on-initial-expect-early-data-reason" |
             "-on-initial-expect-cipher" |
             "-on-resume-expect-cipher" |
@@ -1671,9 +1744,15 @@ pub fn main() {
             }
             "-expect-hrr" => {
                 opts.expect_handshake_kind = Some(vec![HandshakeKind::FullWithHelloRetryRequest]);
+                opts.expect_handshake_kind_resumed = Some(vec![HandshakeKind::ResumedWithHelloRetryRequest]);
             }
             "-expect-no-hrr" => {
                 opts.expect_handshake_kind = Some(vec![HandshakeKind::Full]);
+            }
+            "-on-retry-expect-early-data-reason" | "-on-resume-expect-early-data-reason" => {
+                if args.remove(0) == "hello_retry_request" {
+                    opts.expect_handshake_kind_resumed = Some(vec![HandshakeKind::ResumedWithHelloRetryRequest]);
+                }
             }
             "-expect-session-miss" => {
                 opts.expect_handshake_kind_resumed = Some(vec![
@@ -1706,8 +1785,8 @@ pub fn main() {
             }
 
             "-ocsp-response" => {
-                opts.server_ocsp_response = BASE64_STANDARD.decode(args.remove(0).as_bytes())
-                    .expect("invalid base64");
+                opts.server_ocsp_response = Arc::from(BASE64_STANDARD.decode(args.remove(0).as_bytes())
+                    .expect("invalid base64"));
             }
             "-select-alpn" => {
                 opts.protocols.push(args.remove(0));
@@ -1962,6 +2041,14 @@ pub fn main() {
         }
     }
 
+    if opts.side == Side::Client
+        && opts.on_initial_expect_curve_id != opts.on_resume_expect_curve_id
+    {
+        // expecting server to HRR us to its desired curve
+        opts.expect_handshake_kind_resumed =
+            Some(vec![HandshakeKind::ResumedWithHelloRetryRequest]);
+    }
+
     println!("opts {opts:?}");
 
     #[cfg(unix)]
@@ -1973,60 +2060,58 @@ pub fn main() {
     }
 
     let key_log = Arc::new(KeyLogMemo::default());
-
-    let (mut client_cfg, mut server_cfg) = match opts.side {
-        Side::Client => (Some(make_client_cfg(&opts, &key_log)), None),
-        Side::Server => (None, Some(make_server_cfg(&opts, &key_log))),
+    let mut config = match opts.side {
+        Side::Client => SideConfig::Client(make_client_cfg(&opts, &key_log)),
+        Side::Server => SideConfig::Server(make_server_cfg(&opts, &key_log)),
     };
 
-    fn make_session(
-        opts: &Options,
-        scfg: &Option<Arc<ServerConfig>>,
-        ccfg: &Option<Arc<ClientConfig>>,
-    ) -> Connection {
+    for i in 0..opts.resumes + 1 {
         assert!(opts.quic_transport_params.is_empty());
         assert!(
             opts.expect_quic_transport_params
                 .is_empty()
         );
 
-        if opts.side == Side::Server {
-            let scfg = scfg.as_ref().cloned().unwrap();
-            ServerConnection::new(scfg)
-                .unwrap()
-                .into()
-        } else {
-            let server_name = ServerName::try_from(opts.host_name.as_str())
-                .unwrap()
-                .to_owned();
-            let ccfg = ccfg.as_ref().cloned().unwrap();
-
-            ClientConnection::new(ccfg, server_name)
-                .unwrap()
-                .into()
+        match &config {
+            SideConfig::Client(config) => {
+                let server_name = ServerName::try_from(opts.host_name.as_str())
+                    .unwrap()
+                    .to_owned();
+                let sess = ClientConnection::new(config.clone(), server_name).unwrap();
+                exec(&opts, Connection::Client(sess), &key_log, i);
+            }
+            SideConfig::Server(config) => {
+                let sess = ServerConnection::new(config.clone()).unwrap();
+                exec(&opts, Connection::Server(sess), &key_log, i);
+            }
         }
-    }
 
-    for i in 0..opts.resumes + 1 {
-        let sess = make_session(&opts, &server_cfg, &client_cfg);
-        exec(&opts, sess, &key_log, i);
         if opts.resume_with_tickets_disabled {
             opts.tickets = false;
 
-            match opts.side {
-                Side::Server => server_cfg = Some(make_server_cfg(&opts, &key_log)),
-                Side::Client => client_cfg = Some(make_client_cfg(&opts, &key_log)),
+            match &mut config {
+                SideConfig::Server(server) => *server = make_server_cfg(&opts, &key_log),
+                SideConfig::Client(client) => *client = make_client_cfg(&opts, &key_log),
             };
         }
+
         if opts.on_resume_ech_config_list.is_some() {
             opts.ech_config_list
                 .clone_from(&opts.on_resume_ech_config_list);
             opts.expect_ech_accept = opts.on_resume_expect_ech_accept;
-            client_cfg = Some(make_client_cfg(&opts, &key_log));
+            if let SideConfig::Client(client_cfg) = &mut config {
+                *client_cfg = make_client_cfg(&opts, &key_log);
+            }
         }
+
         opts.expect_handshake_kind
             .clone_from(&opts.expect_handshake_kind_resumed);
     }
+}
+
+enum SideConfig {
+    Client(Arc<ClientConfig>),
+    Server(Arc<ServerConfig>),
 }
 
 #[derive(Debug, Default)]
@@ -2193,7 +2278,7 @@ impl compress::CertCompressor for RandomAlgorithm {
         let random_byte = {
             let mut bytes = [0];
             // nb. provider is irrelevant for this use
-            ring::default_provider()
+            ring::DEFAULT_PROVIDER
                 .secure_random
                 .fill(&mut bytes)
                 .unwrap();

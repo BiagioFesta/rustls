@@ -1,20 +1,13 @@
+use alloc::vec::Vec;
+
+use crate::crypto::cipher::{InboundPlainMessage, Payload, PlainMessage};
 use crate::enums::{AlertDescription, ContentType, HandshakeType, ProtocolVersion};
 use crate::error::InvalidMessage;
 use crate::msgs::alert::AlertMessagePayload;
-use crate::msgs::base::Payload;
 use crate::msgs::ccs::ChangeCipherSpecPayload;
 use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::enums::{AlertLevel, KeyUpdateRequest};
 use crate::msgs::handshake::{HandshakeMessagePayload, HandshakePayload};
-
-mod inbound;
-pub use inbound::{BorrowedPayload, InboundOpaqueMessage, InboundPlainMessage};
-
-mod outbound;
-use alloc::vec::Vec;
-
-pub(crate) use outbound::read_opaque_message_header;
-pub use outbound::{OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload};
 
 #[non_exhaustive]
 #[derive(Debug)]
@@ -32,7 +25,7 @@ pub enum MessagePayload<'a> {
 }
 
 impl<'a> MessagePayload<'a> {
-    pub fn encode(&self, bytes: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, bytes: &mut Vec<u8>) {
         match self {
             Self::Alert(x) => x.encode(bytes),
             Self::Handshake { encoded, .. } => bytes.extend(encoded.bytes()),
@@ -42,14 +35,14 @@ impl<'a> MessagePayload<'a> {
         }
     }
 
-    pub fn handshake(parsed: HandshakeMessagePayload<'a>) -> Self {
+    pub(crate) fn handshake(parsed: HandshakeMessagePayload<'a>) -> Self {
         Self::Handshake {
             encoded: Payload::new(parsed.get_encoding()),
             parsed,
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         typ: ContentType,
         vers: ProtocolVersion,
         payload: &'a [u8],
@@ -71,7 +64,7 @@ impl<'a> MessagePayload<'a> {
         }
     }
 
-    pub fn content_type(&self) -> ContentType {
+    pub(crate) fn content_type(&self) -> ContentType {
         match self {
             Self::Alert(_) => ContentType::Alert,
             Self::Handshake { .. } | Self::HandshakeFlight(_) => ContentType::Handshake,
@@ -115,46 +108,8 @@ impl From<Message<'_>> for PlainMessage {
     }
 }
 
-/// A decrypted TLS frame
-///
-/// This type owns all memory for its interior parts. It can be decrypted from an OpaqueMessage
-/// or encrypted into an OpaqueMessage, and it is also used for joining and fragmenting.
-#[allow(clippy::exhaustive_structs)]
-#[derive(Clone, Debug)]
-pub struct PlainMessage {
-    pub typ: ContentType,
-    pub version: ProtocolVersion,
-    pub payload: Payload<'static>,
-}
-
-impl PlainMessage {
-    pub fn into_unencrypted_opaque(self) -> OutboundOpaqueMessage {
-        OutboundOpaqueMessage {
-            version: self.version,
-            typ: self.typ,
-            payload: PrefixedPayload::from(self.payload.bytes()),
-        }
-    }
-
-    pub fn borrow_inbound(&self) -> InboundPlainMessage<'_> {
-        InboundPlainMessage {
-            version: self.version,
-            typ: self.typ,
-            payload: self.payload.bytes(),
-        }
-    }
-
-    pub fn borrow_outbound(&self) -> OutboundPlainMessage<'_> {
-        OutboundPlainMessage {
-            version: self.version,
-            typ: self.typ,
-            payload: self.payload.bytes().into(),
-        }
-    }
-}
-
 /// A message with decoded payload
-#[allow(clippy::exhaustive_structs)]
+#[expect(clippy::exhaustive_structs)]
 #[derive(Debug)]
 pub struct Message<'a> {
     pub version: ProtocolVersion,
@@ -162,15 +117,6 @@ pub struct Message<'a> {
 }
 
 impl Message<'_> {
-    pub fn is_handshake_type(&self, hstyp: HandshakeType) -> bool {
-        // Bit of a layering violation, but OK.
-        if let MessagePayload::Handshake { parsed, .. } = &self.payload {
-            parsed.0.handshake_type() == hstyp
-        } else {
-            false
-        }
-    }
-
     pub fn build_alert(level: AlertLevel, desc: AlertDescription) -> Self {
         Self {
             version: ProtocolVersion::TLSv1_2,
@@ -214,6 +160,13 @@ impl Message<'_> {
             .into_unencrypted_opaque()
             .encode()
     }
+
+    pub(crate) fn handshake_type(&self) -> Option<HandshakeType> {
+        match &self.payload {
+            MessagePayload::Handshake { parsed, .. } => Some(parsed.0.handshake_type()),
+            _ => None,
+        }
+    }
 }
 
 impl TryFrom<PlainMessage> for Message<'static> {
@@ -232,6 +185,8 @@ impl TryFrom<PlainMessage> for Message<'static> {
 ///
 /// A [`PlainMessage`] must contain plaintext content. Encrypted content should be stored in an
 /// [`InboundOpaqueMessage`] and decrypted before being stored into a [`PlainMessage`].
+///
+/// [`InboundOpaqueMessage`]: crate::crypto::cipher::InboundOpaqueMessage
 impl<'a> TryFrom<InboundPlainMessage<'a>> for Message<'a> {
     type Error = InvalidMessage;
 
@@ -241,6 +196,41 @@ impl<'a> TryFrom<InboundPlainMessage<'a>> for Message<'a> {
             payload: MessagePayload::new(plain.typ, plain.version, plain.payload)?,
         })
     }
+}
+
+pub(crate) fn read_opaque_message_header(
+    r: &mut Reader<'_>,
+) -> Result<(ContentType, ProtocolVersion, u16), MessageError> {
+    let typ = ContentType::read(r).map_err(|_| MessageError::TooShortForHeader)?;
+    // Don't accept any new content-types.
+    if let ContentType::Unknown(_) = typ {
+        return Err(MessageError::InvalidContentType);
+    }
+
+    let version = ProtocolVersion::read(r).map_err(|_| MessageError::TooShortForHeader)?;
+    // Accept only versions 0x03XX for any XX.
+    match &version {
+        ProtocolVersion::Unknown(v) if (v & 0xff00) != 0x0300 => {
+            return Err(MessageError::UnknownProtocolVersion);
+        }
+        _ => {}
+    };
+
+    let len = u16::read(r).map_err(|_| MessageError::TooShortForHeader)?;
+
+    // Reject undersize messages
+    //  implemented per section 5.1 of RFC8446 (TLSv1.3)
+    //              per section 6.2.1 of RFC5246 (TLSv1.2)
+    if typ != ContentType::ApplicationData && len == 0 {
+        return Err(MessageError::InvalidEmptyPayload);
+    }
+
+    // Reject oversize messages
+    if len >= MAX_PAYLOAD {
+        return Err(MessageError::MessageTooLarge);
+    }
+
+    Ok((typ, version, len))
 }
 
 #[derive(Debug)]
@@ -258,7 +248,7 @@ pub(crate) const HEADER_SIZE: usize = 1 + 2 + 2;
 
 /// Maximum message payload size.
 /// That's 2^14 payload bytes and a 2KB allowance for ciphertext overheads.
-const MAX_PAYLOAD: u16 = 16_384 + 2048;
+pub(crate) const MAX_PAYLOAD: u16 = 16_384 + 2048;
 
 /// Maximum on-the-wire message size.
 #[cfg(feature = "std")]

@@ -1,15 +1,16 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
-#[cfg(feature = "log")]
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
+use core::time::Duration;
 use core::{fmt, iter};
 
 use pki_types::{CertificateDer, DnsName};
 
-use crate::crypto::{ActiveKeyExchange, SecureRandom};
+use crate::crypto::cipher::Payload;
+use crate::crypto::{ActiveKeyExchange, SecureRandom, SelectedCredential};
 use crate::enums::{
     CertificateCompressionAlgorithm, CertificateType, CipherSuite, EchClientHelloType,
     HandshakeType, ProtocolVersion, SignatureScheme,
@@ -17,9 +18,10 @@ use crate::enums::{
 use crate::error::InvalidMessage;
 use crate::ffdhe_groups::FfdheGroup;
 use crate::log::warn;
-use crate::msgs::base::{MaybeEmpty, NonEmpty, Payload, PayloadU8, PayloadU16, PayloadU24};
+use crate::msgs::base::{MaybeEmpty, NonEmpty, PayloadU8, PayloadU16, PayloadU24};
 use crate::msgs::codec::{
-    self, Codec, LengthPrefixedBuffer, ListLength, Reader, TlsListElement, TlsListIter,
+    self, CERTIFICATE_MAX_SIZE_LIMIT, Codec, LengthPrefixedBuffer, ListLength, Reader,
+    TlsListElement, TlsListIter,
 };
 use crate::msgs::enums::{
     CertificateStatusType, ClientCertificateType, Compression, ECCurveType, ECPointFormat,
@@ -284,6 +286,16 @@ impl ServerNamePayload<'_> {
     const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
         empty_error: InvalidMessage::IllegalEmptyList("ServerNames"),
     };
+
+    /// Get the `DnsName` out of this `ServerNamePayload` if it contains one.
+    /// The returned `DnsName` will be normalized (converted to lowercase).
+    pub(crate) fn to_dns_name_normalized(&self) -> Option<DnsName<'static>> {
+        match self {
+            Self::SingleDnsName(dns_name) => Some(dns_name.to_lowercase_owned()),
+            Self::IpAddress => None,
+            Self::Invalid => None,
+        }
+    }
 }
 
 /// Simplified encoding/decoding for a `ServerName` extension payload to/from `DnsName`
@@ -341,9 +353,7 @@ impl<'a> Codec<'a> for ServerNamePayload<'a> {
                 }
 
                 HostNamePayload::IpAddress(_invalid) => {
-                    warn!(
-                        "Illegal SNI extension: ignoring IP address presented as hostname ({_invalid:?})"
-                    );
+                    warn!("Illegal SNI extension: IP address presented as hostname ({_invalid:?})");
                     Some(Self::IpAddress)
                 }
 
@@ -1609,12 +1619,21 @@ impl DerefMut for ServerHelloPayload {
 #[derive(Clone, Default, Debug)]
 pub(crate) struct CertificateChain<'a>(pub(crate) Vec<CertificateDer<'a>>);
 
-impl CertificateChain<'_> {
+impl<'a> CertificateChain<'a> {
+    pub(crate) fn from_signer(signer: &'a SelectedCredential) -> Self {
+        Self(
+            signer
+                .identity
+                .as_certificates()
+                .collect(),
+        )
+    }
+
     pub(crate) fn into_owned(self) -> CertificateChain<'static> {
         CertificateChain(
             self.0
                 .into_iter()
-                .map(|c| c.into_owned())
+                .map(CertificateDer::into_owned)
                 .collect(),
         )
     }
@@ -1626,7 +1645,12 @@ impl<'a> Codec<'a> for CertificateChain<'a> {
     }
 
     fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
-        Vec::read(r).map(Self)
+        let mut ret = Vec::new();
+        for item in TlsListIter::<CertificateDer<'a>>::new(r)? {
+            ret.push(item?);
+        }
+
+        Ok(Self(ret))
     }
 }
 
@@ -1637,20 +1661,6 @@ impl<'a> Deref for CertificateChain<'a> {
         &self.0
     }
 }
-
-impl TlsListElement for CertificateDer<'_> {
-    const SIZE_LEN: ListLength = ListLength::U24 {
-        max: CERTIFICATE_MAX_SIZE_LIMIT,
-        error: InvalidMessage::CertificatePayloadTooLarge,
-    };
-}
-
-/// TLS has a 16MB size limit on any handshake message,
-/// plus a 16MB limit on any given certificate.
-///
-/// We contract that to 64KB to limit the amount of memory allocation
-/// that is directly controllable by the peer.
-pub(crate) const CERTIFICATE_MAX_SIZE_LIMIT: usize = 0x1_0000;
 
 extension_struct! {
     pub(crate) struct CertificateExtensions<'a> {
@@ -1741,25 +1751,16 @@ pub(crate) struct CertificatePayloadTls13<'a> {
     pub(crate) entries: Vec<CertificateEntry<'a>>,
 }
 
-impl<'a> Codec<'a> for CertificatePayloadTls13<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        self.context.encode(bytes);
-        self.entries.encode(bytes);
-    }
-
-    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
-        Ok(Self {
-            context: PayloadU8::read(r)?,
-            entries: Vec::read(r)?,
-        })
-    }
-}
-
 impl<'a> CertificatePayloadTls13<'a> {
     pub(crate) fn new(
-        certs: impl Iterator<Item = &'a CertificateDer<'a>>,
+        certs: impl Iterator<Item = CertificateDer<'a>>,
         ocsp_response: Option<&'a [u8]>,
     ) -> Self {
+        let ocsp_response = match ocsp_response {
+            Some([]) | None => None,
+            Some(bytes) => Some(bytes),
+        };
+
         Self {
             context: PayloadU8::empty(),
             entries: certs
@@ -1801,13 +1802,7 @@ impl<'a> CertificatePayloadTls13<'a> {
             .extensions
             .status
             .as_ref()
-            .map(|status| {
-                status
-                    .ocsp_response
-                    .0
-                    .clone()
-                    .into_vec()
-            })
+            .map(|status| status.ocsp_response.as_ref().to_vec())
             .unwrap_or_default()
     }
 
@@ -1818,6 +1813,20 @@ impl<'a> CertificatePayloadTls13<'a> {
                 .map(|e| e.cert)
                 .collect(),
         )
+    }
+}
+
+impl<'a> Codec<'a> for CertificatePayloadTls13<'a> {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        self.context.encode(bytes);
+        self.entries.encode(bytes);
+    }
+
+    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+        Ok(Self {
+            context: PayloadU8::read(r)?,
+            entries: Vec::read(r)?,
+        })
     }
 }
 
@@ -1975,14 +1984,13 @@ impl Codec<'_> for ServerEcdhParams {
 }
 
 #[derive(Debug)]
-#[allow(non_snake_case)]
 pub(crate) struct ServerDhParams {
     /// RFC5246: `opaque dh_p<1..2^16-1>;`
     pub(crate) dh_p: PayloadU16<NonEmpty>,
     /// RFC5246: `opaque dh_g<1..2^16-1>;`
     pub(crate) dh_g: PayloadU16<NonEmpty>,
     /// RFC5246: `opaque dh_Ys<1..2^16-1>;`
-    pub(crate) dh_Ys: PayloadU16<NonEmpty>,
+    pub(crate) dh_ys: PayloadU16<NonEmpty>,
 }
 
 impl ServerDhParams {
@@ -1994,7 +2002,7 @@ impl ServerDhParams {
         Self {
             dh_p: PayloadU16::new(params.p.to_vec()),
             dh_g: PayloadU16::new(params.g.to_vec()),
-            dh_Ys: PayloadU16::new(kx.pub_key().to_vec()),
+            dh_ys: PayloadU16::new(kx.pub_key().to_vec()),
         }
     }
 
@@ -2007,19 +2015,18 @@ impl Codec<'_> for ServerDhParams {
     fn encode(&self, bytes: &mut Vec<u8>) {
         self.dh_p.encode(bytes);
         self.dh_g.encode(bytes);
-        self.dh_Ys.encode(bytes);
+        self.dh_ys.encode(bytes);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
         Ok(Self {
             dh_p: PayloadU16::read(r)?,
             dh_g: PayloadU16::read(r)?,
-            dh_Ys: PayloadU16::read(r)?,
+            dh_ys: PayloadU16::read(r)?,
         })
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum ServerKeyExchangeParams {
     Ecdh(ServerEcdhParams),
@@ -2037,7 +2044,7 @@ impl ServerKeyExchangeParams {
     pub(crate) fn pub_key(&self) -> &[u8] {
         match self {
             Self::Ecdh(ecdh) => &ecdh.public.0,
-            Self::Dh(dh) => &dh.dh_Ys.0,
+            Self::Dh(dh) => &dh.dh_ys.0,
         }
     }
 
@@ -2158,6 +2165,12 @@ impl DistinguishedName {
     }
 }
 
+impl PartialEq for DistinguishedName {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.0 == other.0.0
+    }
+}
+
 /// RFC8446: `DistinguishedName authorities<3..2^16-1>;` however,
 /// RFC5246: `DistinguishedName certificate_authorities<0..2^16-1>;`
 impl TlsListElement for DistinguishedName {
@@ -2269,7 +2282,7 @@ impl Codec<'_> for CertificateRequestPayloadTls13 {
 // -- NewSessionTicket --
 #[derive(Debug)]
 pub(crate) struct NewSessionTicketPayload {
-    pub(crate) lifetime_hint: u32,
+    pub(crate) lifetime_hint: Duration,
     // Tickets can be large (KB), so we deserialise this straight
     // into an Arc, so it can be passed directly into the client's
     // session object without copying.
@@ -2277,7 +2290,7 @@ pub(crate) struct NewSessionTicketPayload {
 }
 
 impl NewSessionTicketPayload {
-    pub(crate) fn new(lifetime_hint: u32, ticket: Vec<u8>) -> Self {
+    pub(crate) fn new(lifetime_hint: Duration, ticket: Vec<u8>) -> Self {
         Self {
             lifetime_hint,
             ticket: Arc::new(PayloadU16::new(ticket)),
@@ -2287,17 +2300,14 @@ impl NewSessionTicketPayload {
 
 impl Codec<'_> for NewSessionTicketPayload {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        self.lifetime_hint.encode(bytes);
+        (self.lifetime_hint.as_secs() as u32).encode(bytes);
         self.ticket.encode(bytes);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
-        let lifetime = u32::read(r)?;
-        let ticket = Arc::new(PayloadU16::read(r)?);
-
         Ok(Self {
-            lifetime_hint: lifetime,
-            ticket,
+            lifetime_hint: Duration::from_secs(u32::read(r)? as u64),
+            ticket: Arc::new(PayloadU16::read(r)?),
         })
     }
 }
@@ -2337,7 +2347,7 @@ impl Codec<'_> for NewSessionTicketExtensions {
 
 #[derive(Debug)]
 pub(crate) struct NewSessionTicketPayloadTls13 {
-    pub(crate) lifetime: u32,
+    pub(crate) lifetime: Duration,
     pub(crate) age_add: u32,
     pub(crate) nonce: PayloadU8,
     pub(crate) ticket: Arc<PayloadU16>,
@@ -2345,7 +2355,7 @@ pub(crate) struct NewSessionTicketPayloadTls13 {
 }
 
 impl NewSessionTicketPayloadTls13 {
-    pub(crate) fn new(lifetime: u32, age_add: u32, nonce: [u8; 32], ticket: Vec<u8>) -> Self {
+    pub(crate) fn new(lifetime: Duration, age_add: u32, nonce: [u8; 32], ticket: Vec<u8>) -> Self {
         Self {
             lifetime,
             age_add,
@@ -2358,7 +2368,7 @@ impl NewSessionTicketPayloadTls13 {
 
 impl Codec<'_> for NewSessionTicketPayloadTls13 {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        self.lifetime.encode(bytes);
+        (self.lifetime.as_secs() as u32).encode(bytes);
         self.age_add.encode(bytes);
         self.nonce.encode(bytes);
         self.ticket.encode(bytes);
@@ -2366,7 +2376,7 @@ impl Codec<'_> for NewSessionTicketPayloadTls13 {
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
-        let lifetime = u32::read(r)?;
+        let lifetime = Duration::from_secs(u32::read(r)? as u64);
         let age_add = u32::read(r)?;
         let nonce = PayloadU8::read(r)?;
         // nb. RFC8446: `opaque ticket<1..2^16-1>;`
@@ -2392,7 +2402,8 @@ impl Codec<'_> for NewSessionTicketPayloadTls13 {
 /// Only supports OCSP
 #[derive(Clone, Debug)]
 pub(crate) struct CertificateStatus<'a> {
-    pub(crate) ocsp_response: PayloadU24<'a>,
+    /// `opaque OCSPResponse<1..2^24-1>;`
+    pub(crate) ocsp_response: PayloadU24<'a, NonEmpty>,
 }
 
 impl<'a> Codec<'a> for CertificateStatus<'a> {
@@ -2416,12 +2427,12 @@ impl<'a> Codec<'a> for CertificateStatus<'a> {
 impl<'a> CertificateStatus<'a> {
     pub(crate) fn new(ocsp: &'a [u8]) -> Self {
         CertificateStatus {
-            ocsp_response: PayloadU24(Payload::Borrowed(ocsp)),
+            ocsp_response: PayloadU24::from(Payload::Borrowed(ocsp)),
         }
     }
 
     pub(crate) fn into_inner(self) -> Vec<u8> {
-        self.ocsp_response.0.into_vec()
+        self.ocsp_response.into_vec()
     }
 
     pub(crate) fn into_owned(self) -> CertificateStatus<'static> {
@@ -2437,7 +2448,8 @@ impl<'a> CertificateStatus<'a> {
 pub(crate) struct CompressedCertificatePayload<'a> {
     pub(crate) alg: CertificateCompressionAlgorithm,
     pub(crate) uncompressed_len: u32,
-    pub(crate) compressed: PayloadU24<'a>,
+    /// `opaque compressed_certificate_message<1..2^24-1>;`
+    pub(crate) compressed: PayloadU24<'a, NonEmpty>,
 }
 
 impl<'a> Codec<'a> for CompressedCertificatePayload<'a> {
@@ -2468,7 +2480,7 @@ impl CompressedCertificatePayload<'_> {
         CompressedCertificatePayload {
             alg: self.alg,
             uncompressed_len: self.uncompressed_len,
-            compressed: PayloadU24(Payload::Borrowed(self.compressed.0.bytes())),
+            compressed: PayloadU24::from(Payload::Borrowed(self.compressed.as_ref())),
         }
     }
 }
@@ -2759,7 +2771,7 @@ impl<'a> HandshakeMessagePayload<'a> {
     }
 }
 
-#[allow(clippy::exhaustive_structs)]
+#[expect(clippy::exhaustive_structs)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HpkeSymmetricCipherSuite {
     pub kdf_id: HpkeKdf,
@@ -2787,7 +2799,6 @@ impl TlsListElement for HpkeSymmetricCipherSuite {
     };
 }
 
-#[allow(clippy::exhaustive_structs)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct HpkeKeyConfig {
     pub config_id: u8,
@@ -2816,7 +2827,6 @@ impl Codec<'_> for HpkeKeyConfig {
     }
 }
 
-#[allow(clippy::exhaustive_structs)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct EchConfigContents {
     pub key_config: HpkeKeyConfig,
@@ -2956,7 +2966,7 @@ impl Codec<'_> for EchConfigExtension {
         let len = u16::read(r)? as usize;
         let mut sub = r.sub(len)?;
 
-        #[allow(clippy::match_single_binding)] // Future-proofing.
+        #[expect(clippy::match_single_binding)] // Future-proofing.
         let ext = match typ {
             _ => Self::Unknown(UnknownExtension::read(typ, &mut sub)),
         };

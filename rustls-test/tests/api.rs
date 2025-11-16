@@ -1,17 +1,38 @@
 use std::cell::RefCell;
 
-#[macro_use]
-mod macros;
-
 #[cfg(feature = "ring")]
 #[path = "."]
 mod tests_with_ring {
     use super::*;
 
-    provider_ring!();
+    rustls_test::provider_ring!();
 
-    #[path = "../api.rs"]
+    #[path = "api/client_cert_verifier.rs"]
+    mod client_cert_verifier;
+    #[path = "api/compress.rs"]
+    mod compress;
+    #[path = "api/crypto.rs"]
+    mod crypto;
+    #[path = "api/ffdhe.rs"]
+    mod ffdhe;
+    #[path = "api/io.rs"]
+    mod io;
+    #[path = "api/kx.rs"]
+    mod kx;
+    #[path = "api/quic.rs"]
+    mod quic;
+    #[path = "api/raw_keys.rs"]
+    mod raw_keys;
+    #[path = "api/resolve.rs"]
+    mod resolve;
+    #[path = "api/resume.rs"]
+    mod resume;
+    #[path = "api/server_cert_verifier.rs"]
+    mod server_cert_verifier;
+    #[path = "api/api.rs"]
     mod tests;
+    #[path = "api/unbuffered.rs"]
+    mod unbuffered;
 }
 
 #[cfg(feature = "aws-lc-rs")]
@@ -19,10 +40,34 @@ mod tests_with_ring {
 mod tests_with_aws_lc_rs {
     use super::*;
 
-    provider_aws_lc_rs!();
+    rustls_test::provider_aws_lc_rs!();
 
-    #[path = "../api.rs"]
+    #[path = "api/client_cert_verifier.rs"]
+    mod client_cert_verifier;
+    #[path = "api/compress.rs"]
+    mod compress;
+    #[path = "api/crypto.rs"]
+    mod crypto;
+    #[path = "api/ffdhe.rs"]
+    mod ffdhe;
+    #[path = "api/io.rs"]
+    mod io;
+    #[path = "api/kx.rs"]
+    mod kx;
+    #[path = "api/quic.rs"]
+    mod quic;
+    #[path = "api/raw_keys.rs"]
+    mod raw_keys;
+    #[path = "api/resolve.rs"]
+    mod resolve;
+    #[path = "api/resume.rs"]
+    mod resume;
+    #[path = "api/server_cert_verifier.rs"]
+    mod server_cert_verifier;
+    #[path = "api/api.rs"]
     mod tests;
+    #[path = "api/unbuffered.rs"]
+    mod unbuffered;
 }
 
 // this must be outside tests_with_*, as we want

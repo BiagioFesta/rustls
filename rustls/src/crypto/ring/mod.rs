@@ -1,17 +1,26 @@
+use alloc::borrow::Cow;
+use alloc::boxed::Box;
+
 use pki_types::PrivateKeyDer;
-pub(crate) use ring as ring_like;
 use webpki::ring as webpki_algs;
 
-use crate::crypto::{CryptoProvider, KeyProvider, SecureRandom, SupportedKxGroup};
+use super::signer::SigningKey;
+use crate::crypto::{
+    CryptoProvider, KeyProvider, SecureRandom, SupportedKxGroup, TicketProducer, TicketerFactory,
+};
 use crate::enums::SignatureScheme;
+use crate::error::Error;
 use crate::rand::GetRandomFailed;
-use crate::sign::SigningKey;
 use crate::sync::Arc;
+#[cfg(feature = "std")]
+use crate::ticketer::TicketRotator;
+use crate::tls12::Tls12CipherSuite;
+use crate::tls13::Tls13CipherSuite;
 use crate::webpki::WebPkiSupportedAlgorithms;
-use crate::{Error, Tls12CipherSuite, Tls13CipherSuite};
 
 /// Using software keys for authentication.
 pub mod sign;
+use sign::{EcdsaSigner, Ed25519Signer, RsaSigningKey};
 
 pub(crate) mod hash;
 pub(crate) mod hmac;
@@ -19,22 +28,37 @@ pub(crate) mod kx;
 pub(crate) mod quic;
 #[cfg(feature = "std")]
 pub(crate) mod ticketer;
+#[cfg(feature = "std")]
+use ticketer::AeadTicketer;
 pub(crate) mod tls12;
 pub(crate) mod tls13;
 
-/// A `CryptoProvider` backed by the [*ring*] crate.
+/// The default `CryptoProvider` backed by [*ring*].
 ///
 /// [*ring*]: https://github.com/briansmith/ring
-pub fn default_provider() -> CryptoProvider {
-    CryptoProvider {
-        tls12_cipher_suites: DEFAULT_TLS12_CIPHER_SUITES.to_vec(),
-        tls13_cipher_suites: DEFAULT_TLS13_CIPHER_SUITES.to_vec(),
-        kx_groups: DEFAULT_KX_GROUPS.to_vec(),
-        signature_verification_algorithms: SUPPORTED_SIG_ALGS,
-        secure_random: &Ring,
-        key_provider: &Ring,
-    }
-}
+pub const DEFAULT_PROVIDER: CryptoProvider = CryptoProvider {
+    tls12_cipher_suites: Cow::Borrowed(DEFAULT_TLS12_CIPHER_SUITES),
+    tls13_cipher_suites: Cow::Borrowed(DEFAULT_TLS13_CIPHER_SUITES),
+    kx_groups: Cow::Borrowed(DEFAULT_KX_GROUPS),
+    signature_verification_algorithms: SUPPORTED_SIG_ALGS,
+    secure_random: &Ring,
+    key_provider: &Ring,
+    ticketer_factory: &Ring,
+};
+
+/// The default `CryptoProvider` backed by *ring* that only supports TLS1.3.
+pub const DEFAULT_TLS13_PROVIDER: CryptoProvider = CryptoProvider {
+    tls12_cipher_suites: Cow::Borrowed(&[]),
+    ..DEFAULT_PROVIDER
+};
+
+/// The default `CryptoProvider` backed by *ring* that only supports TLS1.2.
+///
+/// Use of TLS1.3 is **strongly** recommended.
+pub const DEFAULT_TLS12_PROVIDER: CryptoProvider = CryptoProvider {
+    tls13_cipher_suites: Cow::Borrowed(&[]),
+    ..DEFAULT_PROVIDER
+};
 
 /// Default crypto provider.
 #[derive(Debug)]
@@ -42,9 +66,8 @@ struct Ring;
 
 impl SecureRandom for Ring {
     fn fill(&self, buf: &mut [u8]) -> Result<(), GetRandomFailed> {
-        use ring_like::rand::SecureRandom;
-
-        ring_like::rand::SystemRandom::new()
+        use ring::rand::SecureRandom;
+        ring::rand::SystemRandom::new()
             .fill(buf)
             .map_err(|_| GetRandomFailed)
     }
@@ -54,8 +77,55 @@ impl KeyProvider for Ring {
     fn load_private_key(
         &self,
         key_der: PrivateKeyDer<'static>,
-    ) -> Result<Arc<dyn SigningKey>, Error> {
-        sign::any_supported_type(&key_der)
+    ) -> Result<Box<dyn SigningKey>, Error> {
+        if let Ok(rsa) = RsaSigningKey::try_from(&key_der) {
+            return Ok(Box::new(rsa));
+        }
+
+        if let Ok(ecdsa) = EcdsaSigner::try_from(&key_der) {
+            return Ok(Box::new(ecdsa));
+        }
+
+        if let PrivateKeyDer::Pkcs8(pkcs8) = key_der {
+            if let Ok(eddsa) = Ed25519Signer::try_from(&pkcs8) {
+                return Ok(Box::new(eddsa));
+            }
+        }
+
+        Err(Error::General(
+            "failed to parse private key as RSA, ECDSA, or EdDSA".into(),
+        ))
+    }
+}
+
+impl TicketerFactory for Ring {
+    /// Make the recommended `Ticketer`.
+    ///
+    /// This produces tickets:
+    ///
+    /// - where each lasts for at least 6 hours,
+    /// - with randomly generated keys, and
+    /// - where keys are rotated every 6 hours.
+    ///
+    /// The encryption mechanism used is Chacha20Poly1305.
+    fn ticketer(&self) -> Result<Arc<dyn TicketProducer>, Error> {
+        #[cfg(feature = "std")]
+        {
+            Ok(Arc::new(TicketRotator::new(
+                TicketRotator::SIX_HOURS,
+                AeadTicketer::new,
+            )?))
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            Err(Error::General(
+                "Ring::ticketer() relies on std-only RwLock via TicketRotator".into(),
+            ))
+        }
+    }
+
+    fn fips(&self) -> bool {
+        fips()
     }
 }
 
@@ -178,22 +248,18 @@ pub static DEFAULT_KX_GROUPS: &[&dyn SupportedKxGroup] = ALL_KX_GROUPS;
 pub static ALL_KX_GROUPS: &[&dyn SupportedKxGroup] =
     &[kx_group::X25519, kx_group::SECP256R1, kx_group::SECP384R1];
 
-#[cfg(feature = "std")]
-pub use ticketer::Ticketer;
-
 /// Compatibility shims between ring 0.16.x and 0.17.x API
 mod ring_shim {
-    use super::ring_like;
+    use ring::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey};
+
     use crate::crypto::SharedSecret;
 
     pub(super) fn agree_ephemeral(
-        priv_key: ring_like::agreement::EphemeralPrivateKey,
-        peer_key: &ring_like::agreement::UnparsedPublicKey<&[u8]>,
+        priv_key: EphemeralPrivateKey,
+        peer_key: &UnparsedPublicKey<&[u8]>,
     ) -> Result<SharedSecret, ()> {
-        ring_like::agreement::agree_ephemeral(priv_key, peer_key, |secret| {
-            SharedSecret::from(secret)
-        })
-        .map_err(|_| ())
+        agreement::agree_ephemeral(priv_key, peer_key, |secret| SharedSecret::from(secret))
+            .map_err(|_| ())
     }
 }
 

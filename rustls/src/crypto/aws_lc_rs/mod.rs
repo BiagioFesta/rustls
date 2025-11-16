@@ -1,20 +1,22 @@
-use alloc::vec::Vec;
+use alloc::borrow::Cow;
+use alloc::boxed::Box;
 
-// aws-lc-rs has a -- roughly -- ring-compatible API, so we just reuse all that
-// glue here.  The shared files should always use `super::ring_like` to access a
-// ring-compatible crate, and `super::ring_shim` to bridge the gaps where they are
-// small.
-pub(crate) use aws_lc_rs as ring_like;
 use pki_types::PrivateKeyDer;
 use webpki::aws_lc_rs as webpki_algs;
 
-use crate::crypto::{CryptoProvider, KeyProvider, SecureRandom, SupportedKxGroup};
+use super::signer::SigningKey;
+use crate::crypto::{
+    CryptoProvider, KeyProvider, SecureRandom, SupportedKxGroup, TicketProducer, TicketerFactory,
+};
 use crate::enums::SignatureScheme;
+use crate::error::{Error, OtherError};
 use crate::rand::GetRandomFailed;
-use crate::sign::SigningKey;
 use crate::sync::Arc;
+#[cfg(feature = "std")]
+use crate::ticketer::TicketRotator;
+use crate::tls12::Tls12CipherSuite;
+use crate::tls13::Tls13CipherSuite;
 use crate::webpki::WebPkiSupportedAlgorithms;
-use crate::{Error, OtherError, Tls12CipherSuite, Tls13CipherSuite};
 
 /// Hybrid public key encryption (HPKE).
 pub mod hpke;
@@ -22,46 +24,43 @@ pub mod hpke;
 pub(crate) mod pq;
 /// Using software keys for authentication.
 pub mod sign;
+use sign::{EcdsaSigner, Ed25519Signer, RsaSigningKey};
 
-#[path = "../ring/hash.rs"]
 pub(crate) mod hash;
-#[path = "../ring/hmac.rs"]
 pub(crate) mod hmac;
-#[path = "../ring/kx.rs"]
 pub(crate) mod kx;
-#[path = "../ring/quic.rs"]
 pub(crate) mod quic;
 #[cfg(feature = "std")]
 pub(crate) mod ticketer;
+#[cfg(feature = "std")]
+use ticketer::Rfc5077Ticketer;
 pub(crate) mod tls12;
 pub(crate) mod tls13;
 
-/// A `CryptoProvider` backed by aws-lc-rs.
-pub fn default_provider() -> CryptoProvider {
-    CryptoProvider {
-        tls12_cipher_suites: DEFAULT_TLS12_CIPHER_SUITES.to_vec(),
-        tls13_cipher_suites: DEFAULT_TLS13_CIPHER_SUITES.to_vec(),
-        kx_groups: default_kx_groups(),
-        signature_verification_algorithms: SUPPORTED_SIG_ALGS,
-        secure_random: &AwsLcRs,
-        key_provider: &AwsLcRs,
-    }
-}
+/// The default `CryptoProvider` backed by aws-lc-rs.
+pub const DEFAULT_PROVIDER: CryptoProvider = CryptoProvider {
+    tls12_cipher_suites: Cow::Borrowed(DEFAULT_TLS12_CIPHER_SUITES),
+    tls13_cipher_suites: Cow::Borrowed(DEFAULT_TLS13_CIPHER_SUITES),
+    kx_groups: Cow::Borrowed(DEFAULT_KX_GROUPS),
+    signature_verification_algorithms: SUPPORTED_SIG_ALGS,
+    secure_random: &AwsLcRs,
+    key_provider: &AwsLcRs,
+    ticketer_factory: &AwsLcRs,
+};
 
-fn default_kx_groups() -> Vec<&'static dyn SupportedKxGroup> {
-    #[cfg(feature = "fips")]
-    {
-        DEFAULT_KX_GROUPS
-            .iter()
-            .filter(|cs| cs.fips())
-            .copied()
-            .collect()
-    }
-    #[cfg(not(feature = "fips"))]
-    {
-        DEFAULT_KX_GROUPS.to_vec()
-    }
-}
+/// The default `CryptoProvider` backed by aws-lc-rs that only supports TLS1.3.
+pub const DEFAULT_TLS13_PROVIDER: CryptoProvider = CryptoProvider {
+    tls12_cipher_suites: Cow::Borrowed(&[]),
+    ..DEFAULT_PROVIDER
+};
+
+/// The default `CryptoProvider` backed by aws-lc-rs that only supports TLS1.2.
+///
+/// Use of TLS1.3 is **strongly** recommended.
+pub const DEFAULT_TLS12_PROVIDER: CryptoProvider = CryptoProvider {
+    tls13_cipher_suites: Cow::Borrowed(&[]),
+    ..DEFAULT_PROVIDER
+};
 
 /// `KeyProvider` impl for aws-lc-rs
 pub static DEFAULT_KEY_PROVIDER: &dyn KeyProvider = &AwsLcRs;
@@ -74,9 +73,9 @@ struct AwsLcRs;
 
 impl SecureRandom for AwsLcRs {
     fn fill(&self, buf: &mut [u8]) -> Result<(), GetRandomFailed> {
-        use ring_like::rand::SecureRandom;
+        use aws_lc_rs::rand::SecureRandom;
 
-        ring_like::rand::SystemRandom::new()
+        aws_lc_rs::rand::SystemRandom::new()
             .fill(buf)
             .map_err(|_| GetRandomFailed)
     }
@@ -90,8 +89,58 @@ impl KeyProvider for AwsLcRs {
     fn load_private_key(
         &self,
         key_der: PrivateKeyDer<'static>,
-    ) -> Result<Arc<dyn SigningKey>, Error> {
-        sign::any_supported_type(&key_der)
+    ) -> Result<Box<dyn SigningKey>, Error> {
+        if let Ok(rsa) = RsaSigningKey::try_from(&key_der) {
+            return Ok(Box::new(rsa));
+        }
+
+        if let Ok(ecdsa) = EcdsaSigner::try_from(&key_der) {
+            return Ok(Box::new(ecdsa));
+        }
+
+        if let PrivateKeyDer::Pkcs8(pkcs8) = key_der {
+            if let Ok(eddsa) = Ed25519Signer::try_from(&pkcs8) {
+                return Ok(Box::new(eddsa));
+            }
+        }
+
+        Err(Error::General(
+            "failed to parse private key as RSA, ECDSA, or EdDSA".into(),
+        ))
+    }
+
+    fn fips(&self) -> bool {
+        fips()
+    }
+}
+
+impl TicketerFactory for AwsLcRs {
+    /// Make the recommended `Ticketer`.
+    ///
+    /// This produces tickets:
+    ///
+    /// - where each lasts for at least 6 hours,
+    /// - with randomly generated keys, and
+    /// - where keys are rotated every 6 hours.
+    ///
+    /// The `Ticketer` uses the [RFC 5077 §4] "Recommended Ticket Construction",
+    /// using AES 256 for encryption and HMAC-SHA256 for ciphertext authentication.
+    ///
+    /// [RFC 5077 §4]: https://www.rfc-editor.org/rfc/rfc5077#section-4
+    fn ticketer(&self) -> Result<Arc<dyn TicketProducer>, Error> {
+        #[cfg(feature = "std")]
+        {
+            Ok(Arc::new(TicketRotator::new(
+                TicketRotator::SIX_HOURS,
+                Rfc5077Ticketer::new,
+            )?))
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            Err(Error::General(
+                "AwsLcRs::ticketer() relies on std-only RwLock via TicketRotator".into(),
+            ))
+        }
     }
 
     fn fips(&self) -> bool {
@@ -196,7 +245,11 @@ pub static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgori
         ),
         (
             SignatureScheme::ECDSA_NISTP521_SHA512,
-            &[webpki_algs::ECDSA_P521_SHA512],
+            &[
+                webpki_algs::ECDSA_P521_SHA512,
+                webpki_algs::ECDSA_P384_SHA512,
+                webpki_algs::ECDSA_P256_SHA512,
+            ],
         ),
         (SignatureScheme::ED25519, &[webpki_algs::ED25519]),
         (
@@ -241,6 +294,7 @@ pub mod kx_group {
 /// in hybrid with X25519.
 pub static DEFAULT_KX_GROUPS: &[&dyn SupportedKxGroup] = &[
     kx_group::X25519MLKEM768,
+    #[cfg(not(feature = "fips"))]
     kx_group::X25519,
     kx_group::SECP256R1,
     kx_group::SECP384R1,
@@ -256,19 +310,17 @@ pub static ALL_KX_GROUPS: &[&dyn SupportedKxGroup] = &[
     kx_group::MLKEM768,
 ];
 
-#[cfg(feature = "std")]
-pub use ticketer::Ticketer;
-
 /// Compatibility shims between ring 0.16.x and 0.17.x API
 mod ring_shim {
-    use super::ring_like;
+    use aws_lc_rs::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey};
+
     use crate::crypto::SharedSecret;
 
     pub(super) fn agree_ephemeral(
-        priv_key: ring_like::agreement::EphemeralPrivateKey,
-        peer_key: &ring_like::agreement::UnparsedPublicKey<&[u8]>,
+        priv_key: EphemeralPrivateKey,
+        peer_key: &UnparsedPublicKey<&[u8]>,
     ) -> Result<SharedSecret, ()> {
-        ring_like::agreement::agree_ephemeral(priv_key, peer_key, (), |secret| {
+        agreement::agree_ephemeral(priv_key, peer_key, (), |secret| {
             Ok(SharedSecret::from(secret))
         })
     }
@@ -279,15 +331,8 @@ pub(super) fn fips() -> bool {
     aws_lc_rs::try_fips_mode().is_ok()
 }
 
-pub(super) fn unspecified_err(_e: aws_lc_rs::error::Unspecified) -> Error {
-    #[cfg(feature = "std")]
-    {
-        Error::Other(OtherError(Arc::new(_e)))
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        Error::Other(OtherError())
-    }
+pub(super) fn unspecified_err(e: aws_lc_rs::error::Unspecified) -> Error {
+    Error::Other(OtherError::new(e))
 }
 
 #[cfg(test)]

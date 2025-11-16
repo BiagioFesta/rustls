@@ -1,10 +1,9 @@
-#![allow(clippy::duplicate_mod)]
-
 use alloc::boxed::Box;
 
-use super::ring_like::aead;
+use ring::aead;
+
 use crate::crypto::cipher::{AeadKey, Iv, Nonce};
-use crate::error::Error;
+use crate::error::{ApiMisuse, Error};
 use crate::quic;
 
 pub(crate) struct HeaderProtectionKey(aead::quic::HeaderProtectionKey);
@@ -27,7 +26,7 @@ impl HeaderProtectionKey {
         let mask = self
             .0
             .new_mask(sample)
-            .map_err(|_| Error::General("sample of invalid length".into()))?;
+            .map_err(|_| Error::ApiMisuse(ApiMisuse::InvalidQuicHeaderProtectionSampleLength))?;
 
         // The `unwrap()` will not panic because `new_mask` returns a
         // non-empty result.
@@ -36,7 +35,7 @@ impl HeaderProtectionKey {
         // It is OK for the `mask` to be longer than `packet_number`,
         // but a valid `packet_number` will never be longer than `mask`.
         if packet_number.len() > pn_mask.len() {
-            return Err(Error::General("packet number too long".into()));
+            return Err(ApiMisuse::InvalidQuicHeaderProtectionPacketNumberLength.into());
         }
 
         // Infallible from this point on. Before this point, `first` and
@@ -134,7 +133,7 @@ impl quic::PacketKey for PacketKey {
     ) -> Result<quic::Tag, Error> {
         let aad = aead::Aad::from(header);
         let nonce_value = Nonce::quic(path_id, &self.iv, packet_number);
-        let nonce = aead::Nonce::assume_unique_for_key(nonce_value.0);
+        let nonce = aead::Nonce::assume_unique_for_key(nonce_value.to_array()?);
         let tag = self
             .key
             .seal_in_place_separate_tag(nonce, aad, payload)
@@ -150,7 +149,7 @@ impl quic::PacketKey for PacketKey {
     ///
     /// On success, returns the slice of `payload` containing the decrypted data.
     ///
-    /// When provided, the `path_id` is used for multipath ecryption as described in
+    /// When provided, the `path_id` is used for multipath encryption as described in
     /// <https://www.ietf.org/archive/id/draft-ietf-quic-multipath-15.html#section-2.4>.
     fn decrypt_in_place<'a>(
         &self,
@@ -162,7 +161,7 @@ impl quic::PacketKey for PacketKey {
         let payload_len = payload.len();
         let aad = aead::Aad::from(header);
         let nonce_value = Nonce::quic(path_id, &self.iv, packet_number);
-        let nonce = aead::Nonce::assume_unique_for_key(nonce_value.0);
+        let nonce = aead::Nonce::assume_unique_for_key(nonce_value.to_array()?);
         self.key
             .open_in_place(nonce, aad, payload)
             .map_err(|_| Error::DecryptError)?;
@@ -220,12 +219,11 @@ impl quic::Algorithm for KeyBuilder {
 }
 
 #[cfg(test)]
-#[macro_rules_attribute::apply(test_for_each_provider)]
 mod tests {
     use std::dbg;
 
-    use super::provider::tls13::{TLS13_AES_128_GCM_SHA256, TLS13_CHACHA20_POLY1305_SHA256};
     use crate::common_state::Side;
+    use crate::crypto::ring::tls13::{TLS13_AES_128_GCM_SHA256, TLS13_CHACHA20_POLY1305_SHA256};
     use crate::crypto::tls13::OkmBlock;
     use crate::quic::*;
 
@@ -294,59 +292,8 @@ mod tests {
     }
 
     #[test]
-    fn key_update_test_vector() {
-        fn equal_okm(x: &OkmBlock, y: &OkmBlock) -> bool {
-            x.as_ref() == y.as_ref()
-        }
-
-        let mut secrets = Secrets::new(
-            // Constant dummy values for reproducibility
-            OkmBlock::new(
-                &[
-                    0xb8, 0x76, 0x77, 0x08, 0xf8, 0x77, 0x23, 0x58, 0xa6, 0xea, 0x9f, 0xc4, 0x3e,
-                    0x4a, 0xdd, 0x2c, 0x96, 0x1b, 0x3f, 0x52, 0x87, 0xa6, 0xd1, 0x46, 0x7e, 0xe0,
-                    0xae, 0xab, 0x33, 0x72, 0x4d, 0xbf,
-                ][..],
-            ),
-            OkmBlock::new(
-                &[
-                    0x42, 0xdc, 0x97, 0x21, 0x40, 0xe0, 0xf2, 0xe3, 0x98, 0x45, 0xb7, 0x67, 0x61,
-                    0x34, 0x39, 0xdc, 0x67, 0x58, 0xca, 0x43, 0x25, 0x9b, 0x87, 0x85, 0x06, 0x82,
-                    0x4e, 0xb1, 0xe4, 0x38, 0xd8, 0x55,
-                ][..],
-            ),
-            TLS13_AES_128_GCM_SHA256,
-            TLS13_AES_128_GCM_SHA256.quic.unwrap(),
-            Side::Client,
-            Version::V1,
-        );
-        secrets.update();
-
-        assert!(equal_okm(
-            &secrets.client,
-            &OkmBlock::new(
-                &[
-                    0x42, 0xca, 0xc8, 0xc9, 0x1c, 0xd5, 0xeb, 0x40, 0x68, 0x2e, 0x43, 0x2e, 0xdf,
-                    0x2d, 0x2b, 0xe9, 0xf4, 0x1a, 0x52, 0xca, 0x6b, 0x22, 0xd8, 0xe6, 0xcd, 0xb1,
-                    0xe8, 0xac, 0xa9, 0x6, 0x1f, 0xce
-                ][..]
-            )
-        ));
-        assert!(equal_okm(
-            &secrets.server,
-            &OkmBlock::new(
-                &[
-                    0xeb, 0x7f, 0x5e, 0x2a, 0x12, 0x3f, 0x40, 0x7d, 0xb4, 0x99, 0xe3, 0x61, 0xca,
-                    0xe5, 0x90, 0xd4, 0xd9, 0x92, 0xe1, 0x4b, 0x7a, 0xce, 0x3, 0xc2, 0x44, 0xe0,
-                    0x42, 0x21, 0x15, 0xb6, 0xd3, 0x8a
-                ][..]
-            )
-        ));
-    }
-
-    #[test]
     fn short_packet_header_protection_v2() {
-        // https://www.ietf.org/archive/id/draft-ietf-quic-v2-10.html#name-chacha20-poly1305-short-head
+        // https://tools.ietf.org/html/rfc9369.html#name-chacha20-poly1305-short-hea
         test_short_packet(
             Version::V2,
             &[
@@ -358,7 +305,7 @@ mod tests {
 
     #[test]
     fn initial_test_vector_v2() {
-        // https://www.ietf.org/archive/id/draft-ietf-quic-v2-10.html#name-sample-packet-protection-2
+        // https://tools.ietf.org/html/rfc9369.html#name-sample-packet-protection
         let icid = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
         let server = Keys::initial(
             Version::V2,

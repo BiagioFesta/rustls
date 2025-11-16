@@ -1,7 +1,7 @@
 //! This module provides tests for the interoperability of raw public keys with OpenSSL, and also
 //! demonstrates how to set up a client-server architecture that utilizes raw public keys.
 //!
-//! The module also includes example implementations of the `ServerCertVerifier` and `ClientCertVerifier` traits, using
+//! The module also includes example implementations of the `ServerVerifier` and `ClientVerifier` traits, using
 //! pre-configured raw public keys for the verification of the peer.
 
 mod client {
@@ -9,25 +9,24 @@ mod client {
     use std::net::TcpStream;
     use std::sync::Arc;
 
-    use rustls::client::AlwaysResolvesClientRawPublicKeys;
     use rustls::client::danger::{
-        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier, ServerIdentity,
+        HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
     };
     use rustls::crypto::{
-        WebPkiSupportedAlgorithms, aws_lc_rs as provider, verify_tls13_signature_with_raw_key,
+        Credentials, Identity, SingleCredential, WebPkiSupportedAlgorithms, aws_lc_rs as provider,
+        verify_tls13_signature,
     };
+    use rustls::enums::{CertificateType, SignatureScheme};
+    use rustls::error::{ApiMisuse, CertificateError, InconsistentKeys, PeerIncompatible};
     use rustls::pki_types::pem::PemObject;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, SubjectPublicKeyInfoDer};
+    use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
     use rustls::server::danger::SignatureVerificationInput;
-    use rustls::sign::CertifiedKey;
-    use rustls::{
-        CertificateError, ClientConfig, ClientConnection, Error, InconsistentKeys,
-        PeerIncompatible, SignatureScheme, Stream,
-    };
+    use rustls::{ClientConfig, ClientConnection, Error, Stream};
 
     /// Build a `ClientConfig` with the given client private key and a server public key to trust.
     pub(super) fn make_config(client_private_key: &str, server_pub_key: &str) -> ClientConfig {
-        let client_private_key = Arc::new(provider::default_provider())
+        let provider = Arc::new(provider::DEFAULT_PROVIDER);
+        let client_private_key = provider
             .key_provider
             .load_private_key(
                 PrivateKeyDer::from_pem_file(client_private_key)
@@ -38,24 +37,21 @@ mod client {
             .public_key()
             .ok_or(Error::InconsistentKeys(InconsistentKeys::Unknown))
             .expect("cannot load public key");
-        let client_public_key_as_cert = CertificateDer::from(client_public_key.to_vec());
 
         let server_raw_key = SubjectPublicKeyInfoDer::from_pem_file(server_pub_key)
             .expect("cannot open pub key file");
 
-        let certified_key = Arc::new(CertifiedKey::new_unchecked(
-            vec![client_public_key_as_cert],
+        let credentials = Credentials::new_unchecked(
+            Arc::new(Identity::RawPublicKey(client_public_key.into_owned())),
             client_private_key,
-        ));
+        );
 
-        ClientConfig::builder()
+        ClientConfig::builder(provider)
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SimpleRpkServerCertVerifier::new(vec![
+            .with_custom_certificate_verifier(Arc::new(SimpleRpkServerVerifier::new(vec![
                 server_raw_key,
             ])))
-            .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(
-                certified_key,
-            )))
+            .with_client_credential_resolver(Arc::new(SingleCredential::from(credentials)))
             .unwrap()
     }
 
@@ -84,32 +80,29 @@ mod client {
     ///
     /// Note: when the verifier is used for Raw Public Keys the `CertificateDer` argument to the functions contains the SPKI instead of a X509 Certificate
     #[derive(Debug)]
-    struct SimpleRpkServerCertVerifier {
+    struct SimpleRpkServerVerifier {
         trusted_spki: Vec<SubjectPublicKeyInfoDer<'static>>,
         supported_algs: WebPkiSupportedAlgorithms,
     }
 
-    impl SimpleRpkServerCertVerifier {
+    impl SimpleRpkServerVerifier {
         fn new(trusted_spki: Vec<SubjectPublicKeyInfoDer<'static>>) -> Self {
             Self {
                 trusted_spki,
-                supported_algs: provider::default_provider().signature_verification_algorithms,
+                supported_algs: provider::DEFAULT_PROVIDER.signature_verification_algorithms,
             }
         }
     }
 
-    impl ServerCertVerifier for SimpleRpkServerCertVerifier {
-        fn verify_server_cert(
-            &self,
-            identity: &ServerIdentity<'_>,
-        ) -> Result<ServerCertVerified, Error> {
-            let end_entity_as_spki = SubjectPublicKeyInfoDer::from(identity.end_entity.as_ref());
-            match self
-                .trusted_spki
-                .contains(&end_entity_as_spki)
-            {
+    impl ServerVerifier for SimpleRpkServerVerifier {
+        fn verify_identity(&self, identity: &ServerIdentity<'_>) -> Result<PeerVerified, Error> {
+            let Identity::RawPublicKey(spki) = identity.identity else {
+                return Err(ApiMisuse::UnverifiableCertificateType.into());
+            };
+
+            match self.trusted_spki.contains(spki) {
                 false => Err(Error::InvalidCertificate(CertificateError::UnknownIssuer)),
-                true => Ok(ServerCertVerified::assertion()),
+                true => Ok(PeerVerified::assertion()),
             }
         }
 
@@ -124,12 +117,7 @@ mod client {
             &self,
             input: &SignatureVerificationInput<'_>,
         ) -> Result<HandshakeSignatureValid, Error> {
-            verify_tls13_signature_with_raw_key(
-                input.message,
-                &SubjectPublicKeyInfoDer::from(input.signer.as_ref()),
-                input.signature,
-                &self.supported_algs,
-            )
+            verify_tls13_signature(input, &self.supported_algs)
         }
 
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -140,8 +128,8 @@ mod client {
             false
         }
 
-        fn requires_raw_public_keys(&self) -> bool {
-            true
+        fn supported_certificate_types(&self) -> &'static [CertificateType] {
+            &[CertificateType::RawPublicKey]
         }
     }
 }
@@ -153,26 +141,25 @@ mod server {
 
     use rustls::client::danger::HandshakeSignatureValid;
     use rustls::crypto::{
-        WebPkiSupportedAlgorithms, aws_lc_rs as provider, verify_tls13_signature_with_raw_key,
+        Credentials, Identity, SingleCredential, WebPkiSupportedAlgorithms, aws_lc_rs as provider,
+        verify_tls13_signature,
     };
+    use rustls::enums::{CertificateType, SignatureScheme};
+    use rustls::error::{ApiMisuse, CertificateError, Error, InconsistentKeys, PeerIncompatible};
     use rustls::pki_types::pem::PemObject;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, SubjectPublicKeyInfoDer};
-    use rustls::server::AlwaysResolvesServerRawPublicKeys;
+    use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
     use rustls::server::danger::{
-        ClientCertVerified, ClientCertVerifier, ClientIdentity, SignatureVerificationInput,
+        ClientIdentity, ClientVerifier, PeerVerified, SignatureVerificationInput,
     };
-    use rustls::sign::CertifiedKey;
-    use rustls::{
-        CertificateError, DistinguishedName, Error, InconsistentKeys, PeerIncompatible,
-        ServerConfig, ServerConnection, SignatureScheme,
-    };
+    use rustls::{DistinguishedName, ServerConfig, ServerConnection};
 
     /// Build a `ServerConfig` with the given server private key and a client public key to trust.
     pub(super) fn make_config(server_private_key: &str, client_pub_key: &str) -> ServerConfig {
         let client_raw_key = SubjectPublicKeyInfoDer::from_pem_file(client_pub_key)
             .expect("cannot open pub key file");
 
-        let server_private_key = provider::default_provider()
+        let provider = Arc::new(provider::DEFAULT_PROVIDER);
+        let server_private_key = provider
             .key_provider
             .load_private_key(
                 PrivateKeyDer::from_pem_file(server_private_key)
@@ -183,19 +170,18 @@ mod server {
             .public_key()
             .ok_or(Error::InconsistentKeys(InconsistentKeys::Unknown))
             .expect("cannot load public key");
-        let server_public_key_as_cert = CertificateDer::from(server_public_key.to_vec());
 
-        let certified_key = Arc::new(CertifiedKey::new_unchecked(
-            vec![server_public_key_as_cert],
+        let credentials = Credentials::new_unchecked(
+            Arc::new(Identity::RawPublicKey(server_public_key.into_owned())),
             server_private_key,
-        ));
+        );
 
-        let client_cert_verifier = Arc::new(SimpleRpkClientCertVerifier::new(vec![client_raw_key]));
-        let server_cert_resolver = Arc::new(AlwaysResolvesServerRawPublicKeys::new(certified_key));
+        let client_cert_verifier = Arc::new(SimpleRpkClientVerifier::new(vec![client_raw_key]));
+        let server_cert_resolver = Arc::new(SingleCredential::from(credentials));
 
-        ServerConfig::builder()
+        ServerConfig::builder(provider)
             .with_client_cert_verifier(client_cert_verifier)
-            .with_cert_resolver(server_cert_resolver)
+            .with_server_credential_resolver(server_cert_resolver)
             .unwrap()
     }
 
@@ -241,36 +227,29 @@ mod server {
     ///
     /// Note: when the verifier is used for Raw Public Keys the `CertificateDer` argument to the functions contains the SPKI instead of a X509 Certificate
     #[derive(Debug)]
-    struct SimpleRpkClientCertVerifier {
+    struct SimpleRpkClientVerifier {
         trusted_spki: Vec<SubjectPublicKeyInfoDer<'static>>,
         supported_algs: WebPkiSupportedAlgorithms,
     }
 
-    impl SimpleRpkClientCertVerifier {
+    impl SimpleRpkClientVerifier {
         pub(crate) fn new(trusted_spki: Vec<SubjectPublicKeyInfoDer<'static>>) -> Self {
             Self {
                 trusted_spki,
-                supported_algs: provider::default_provider().signature_verification_algorithms,
+                supported_algs: provider::DEFAULT_PROVIDER.signature_verification_algorithms,
             }
         }
     }
 
-    impl ClientCertVerifier for SimpleRpkClientCertVerifier {
-        fn root_hint_subjects(&self) -> Arc<[DistinguishedName]> {
-            Arc::from(Vec::new())
-        }
+    impl ClientVerifier for SimpleRpkClientVerifier {
+        fn verify_identity(&self, identity: &ClientIdentity<'_>) -> Result<PeerVerified, Error> {
+            let Identity::RawPublicKey(spki) = identity.identity else {
+                return Err(ApiMisuse::UnverifiableCertificateType.into());
+            };
 
-        fn verify_client_cert(
-            &self,
-            identity: &ClientIdentity<'_>,
-        ) -> Result<ClientCertVerified, Error> {
-            let end_entity_as_spki = SubjectPublicKeyInfoDer::from(identity.end_entity.as_ref());
-            match self
-                .trusted_spki
-                .contains(&end_entity_as_spki)
-            {
+            match self.trusted_spki.contains(spki) {
                 false => Err(Error::InvalidCertificate(CertificateError::UnknownIssuer)),
-                true => Ok(ClientCertVerified::assertion()),
+                true => Ok(PeerVerified::assertion()),
             }
         }
 
@@ -285,20 +264,19 @@ mod server {
             &self,
             input: &SignatureVerificationInput<'_>,
         ) -> Result<HandshakeSignatureValid, Error> {
-            verify_tls13_signature_with_raw_key(
-                input.message,
-                &SubjectPublicKeyInfoDer::from(input.signer.as_ref()),
-                input.signature,
-                &self.supported_algs,
-            )
+            verify_tls13_signature(input, &self.supported_algs)
+        }
+
+        fn root_hint_subjects(&self) -> Arc<[DistinguishedName]> {
+            Arc::from(Vec::new())
         }
 
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
             self.supported_algs.supported_schemes()
         }
 
-        fn requires_raw_public_keys(&self) -> bool {
-            true
+        fn supported_certificate_types(&self) -> &'static [CertificateType] {
+            &[CertificateType::RawPublicKey]
         }
     }
 }
@@ -307,9 +285,11 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::process::{Command, Stdio};
+    use std::sync::Arc;
     use std::sync::mpsc::channel;
     use std::thread;
 
+    use rustls::crypto::{Identity, aws_lc_rs as provider};
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -384,9 +364,12 @@ mod tests {
             .map(|cert| cert.unwrap())
             .collect();
         let private_key = PrivateKeyDer::from_pem_file(private_key_file).unwrap();
-        let config = rustls::ServerConfig::builder()
+        let config = rustls::ServerConfig::builder(Arc::new(provider::DEFAULT_PROVIDER))
             .with_no_client_auth()
-            .with_single_cert(certs, private_key)
+            .with_single_cert(
+                Arc::new(Identity::from_cert_chain(certs).unwrap()),
+                private_key,
+            )
             .unwrap();
         let server_thread = thread::spawn(move || {
             server::run_server(config, listener).expect("failed to run server to completion")

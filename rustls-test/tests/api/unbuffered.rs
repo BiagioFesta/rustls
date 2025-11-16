@@ -1,30 +1,34 @@
 #![allow(clippy::disallowed_types, clippy::duplicate_mod)]
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use rustls::client::{ClientConnectionData, EarlyDataError, UnbufferedClientConnection};
 use rustls::crypto::CryptoProvider;
+use rustls::enums::AlertDescription;
+use rustls::error::{CertificateError, Error, InvalidMessage};
 use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
 use rustls::unbuffered::{
     ConnectionState, EncodeError, EncryptError, InsufficientSizeError, ReadTraffic,
     UnbufferedConnectionCommon, UnbufferedStatus, WriteTraffic,
 };
 use rustls::{
-    AlertDescription, CertificateError, ClientConfig, ConnectionTrafficSecrets, Error,
-    InvalidMessage, ServerConfig, SideData, SupportedCipherSuite,
+    ClientConfig, ConnectionTrafficSecrets, ServerConfig, SideData, SupportedCipherSuite,
+};
+use rustls_test::{
+    ClientConfigExt, KeyType, MockServerVerifier, aes_128_gcm_with_1024_confidentiality_limit,
+    do_unbuffered_handshake, make_client_config, make_server_config, provider_with_one_suite,
+    server_name, unsafe_plaintext_crypto_provider,
 };
 
-use super::*;
-
-mod common;
-use common::*;
-use provider::cipher_suite;
+use super::provider::cipher_suite;
+use super::{ALL_VERSIONS, provider, provider_is_aws_lc_rs, provider_is_fips};
 
 const MAX_ITERATIONS: usize = 100;
 
 #[test]
 fn tls12_handshake() {
-    let outcome = handshake(provider::default_provider().with_only_tls12());
+    let outcome = handshake(provider::DEFAULT_TLS12_PROVIDER);
 
     assert_eq!(
         outcome.client_transcript, TLS12_CLIENT_TRANSCRIPT,
@@ -38,14 +42,11 @@ fn tls12_handshake() {
 
 #[test]
 fn tls12_handshake_fragmented() {
-    let outcome = handshake_config(
-        provider::default_provider().with_only_tls12(),
-        |client, server| {
-            client.max_fragment_size = Some(512);
-            client.cert_decompressors = vec![];
-            server.max_fragment_size = Some(512);
-        },
-    );
+    let outcome = handshake_config(provider::DEFAULT_TLS12_PROVIDER, |client, server| {
+        client.max_fragment_size = Some(512);
+        client.cert_decompressors = vec![];
+        server.max_fragment_size = Some(512);
+    });
 
     let expected_client = TLS12_CLIENT_TRANSCRIPT_FRAGMENTED.to_vec();
     let expected_server = TLS12_SERVER_TRANSCRIPT_FRAGMENTED.to_vec();
@@ -61,7 +62,7 @@ fn tls12_handshake_fragmented() {
 
 #[test]
 fn tls13_handshake() {
-    let outcome = handshake(provider::default_provider().with_only_tls13());
+    let outcome = handshake(provider::DEFAULT_TLS13_PROVIDER);
 
     assert_eq!(
         outcome.client_transcript, TLS13_CLIENT_TRANSCRIPT,
@@ -75,14 +76,11 @@ fn tls13_handshake() {
 
 #[test]
 fn tls13_handshake_fragmented() {
-    let outcome = handshake_config(
-        provider::default_provider().with_only_tls13(),
-        |client, server| {
-            client.max_fragment_size = Some(512);
-            client.cert_decompressors = vec![];
-            server.max_fragment_size = Some(512);
-        },
-    );
+    let outcome = handshake_config(provider::DEFAULT_TLS13_PROVIDER, |client, server| {
+        client.max_fragment_size = Some(512);
+        client.cert_decompressors = vec![];
+        server.max_fragment_size = Some(512);
+    });
 
     let mut expected_client = TLS13_CLIENT_TRANSCRIPT_FRAGMENTED.to_vec();
     let mut expected_server = TLS13_SERVER_TRANSCRIPT_FRAGMENTED.to_vec();
@@ -129,9 +127,8 @@ fn handshake_config(
 
 #[test]
 fn app_data_client_to_server() {
-    let provider = provider::default_provider();
     let expected: &[_] = b"hello";
-    for version_provider in all_versions(&provider) {
+    for version_provider in ALL_VERSIONS {
         eprintln!("{version_provider:?}");
         let server_config = make_server_config(KeyType::Rsa2048, &version_provider);
         let client_config = make_client_config(KeyType::Rsa2048, &version_provider);
@@ -164,9 +161,8 @@ fn app_data_client_to_server() {
 
 #[test]
 fn app_data_server_to_client() {
-    let provider = provider::default_provider();
     let expected: &[_] = b"hello";
-    for version_provider in all_versions(&provider) {
+    for version_provider in ALL_VERSIONS {
         eprintln!("{version_provider:?}");
         let server_config = make_server_config(KeyType::Rsa2048, &version_provider);
         let client_config = make_client_config(KeyType::Rsa2048, &version_provider);
@@ -199,7 +195,7 @@ fn app_data_server_to_client() {
 
 #[test]
 fn early_data() {
-    let provider = provider::default_provider().with_only_tls13();
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
     let expected: &[_] = b"hello";
 
     let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
@@ -437,7 +433,7 @@ fn run(
 
 #[test]
 fn close_notify_client_to_server() {
-    for version_provider in all_versions(&provider::default_provider()) {
+    for version_provider in ALL_VERSIONS {
         eprintln!("{version_provider:?}");
         let server_config = make_server_config(KeyType::Rsa2048, &version_provider);
         let client_config = make_client_config(KeyType::Rsa2048, &version_provider);
@@ -461,7 +457,7 @@ fn close_notify_client_to_server() {
 
 #[test]
 fn close_notify_server_to_client() {
-    for version_provider in all_versions(&provider::default_provider()) {
+    for version_provider in ALL_VERSIONS {
         eprintln!("{version_provider:?}");
         let server_config = make_server_config(KeyType::Rsa2048, &version_provider);
         let client_config = make_client_config(KeyType::Rsa2048, &version_provider);
@@ -485,7 +481,7 @@ fn close_notify_server_to_client() {
 
 #[test]
 fn full_closure_server_to_client() {
-    for version_provider in all_versions(&provider::default_provider()) {
+    for version_provider in ALL_VERSIONS {
         eprintln!("{version_provider:?}");
         let mut outcome = handshake(version_provider);
         let mut client = outcome.client.take().unwrap();
@@ -546,7 +542,7 @@ fn junk_after_close_notify_received() {
     ];
 
     for junk in JUNK_DATA {
-        let mut outcome = handshake(provider::default_provider().with_only_tls13());
+        let mut outcome = handshake(provider::DEFAULT_TLS13_PROVIDER);
         let mut client = outcome.client.take().unwrap();
         let mut server = outcome.server.take().unwrap();
 
@@ -585,7 +581,7 @@ fn junk_after_close_notify_received() {
 
 #[test]
 fn queue_close_notify_is_idempotent() {
-    let mut outcome = handshake(provider::default_provider().with_only_tls13());
+    let mut outcome = handshake(provider::DEFAULT_TLS13_PROVIDER);
     let mut client = outcome.client.take().unwrap();
 
     let mut client_send_buf = [0u8; 128];
@@ -605,7 +601,7 @@ fn queue_close_notify_is_idempotent() {
 
 #[test]
 fn refresh_traffic_keys_on_tls12_connection() {
-    let mut outcome = handshake(provider::default_provider().with_only_tls12());
+    let mut outcome = handshake(provider::DEFAULT_TLS12_PROVIDER);
     let mut client = outcome.client.take().unwrap();
 
     match client.process_tls_records(&mut []) {
@@ -627,7 +623,7 @@ fn refresh_traffic_keys_on_tls12_connection() {
 
 #[test]
 fn refresh_traffic_keys_manually() {
-    let mut outcome = handshake(provider::default_provider().with_only_tls13());
+    let mut outcome = handshake(provider::DEFAULT_TLS13_PROVIDER);
     let mut client = outcome.client.take().unwrap();
     let mut server = outcome.server.take().unwrap();
 
@@ -747,14 +743,12 @@ fn refresh_traffic_keys_automatically() {
     const CONFIDENTIALITY_LIMIT: usize = 1024;
     const CONFIDENTIALITY_LIMIT_PLUS_ONE: usize = CONFIDENTIALITY_LIMIT + 1;
 
-    let client_config = finish_client_config(
-        KeyType::Rsa2048,
-        ClientConfig::builder_with_provider(aes_128_gcm_with_1024_confidentiality_limit(
-            provider::default_provider(),
-        )),
-    );
+    let client_config = ClientConfig::builder(aes_128_gcm_with_1024_confidentiality_limit(
+        provider::DEFAULT_PROVIDER,
+    ))
+    .finish(KeyType::Rsa2048);
 
-    let server_config = make_server_config(KeyType::Rsa2048, &provider::default_provider());
+    let server_config = make_server_config(KeyType::Rsa2048, &provider::DEFAULT_PROVIDER);
     let mut outcome = run(
         Arc::new(client_config),
         &mut NO_ACTIONS.clone(),
@@ -817,19 +811,16 @@ fn refresh_traffic_keys_automatically() {
 #[test]
 fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
     const CONFIDENTIALITY_LIMIT: usize = 1024;
-    let provider = Arc::new(
-        Arc::unwrap_or_clone(aes_128_gcm_with_1024_confidentiality_limit(dbg!(
-            provider::default_provider()
+    let provider = Arc::new(CryptoProvider {
+        tls13_cipher_suites: Default::default(),
+        ..Arc::unwrap_or_clone(aes_128_gcm_with_1024_confidentiality_limit(dbg!(
+            provider::DEFAULT_PROVIDER
         )))
-        .with_only_tls12(),
-    );
+    });
 
-    let client_config = finish_client_config(
-        KeyType::Ed25519,
-        ClientConfig::builder_with_provider(provider),
-    );
+    let client_config = ClientConfig::builder(provider).finish(KeyType::Ed25519);
 
-    let server_config = make_server_config(KeyType::Ed25519, &provider::default_provider());
+    let server_config = make_server_config(KeyType::Ed25519, &provider::DEFAULT_PROVIDER);
     let mut outcome = run(
         Arc::new(client_config),
         &mut NO_ACTIONS.clone(),
@@ -900,15 +891,14 @@ fn tls13_packed_handshake() {
     }
 
     // regression test for https://github.com/rustls/rustls/issues/2040
-    let client_config = ClientConfig::builder_with_provider(unsafe_plaintext_crypto_provider(
-        provider::default_provider(),
-    ))
-    .dangerous()
-    .with_custom_certificate_verifier(Arc::new(MockServerVerifier::rejects_certificate(
-        CertificateError::UnknownIssuer.into(),
-    )))
-    .with_no_client_auth()
-    .unwrap();
+    let client_config =
+        ClientConfig::builder(unsafe_plaintext_crypto_provider(provider::DEFAULT_PROVIDER))
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(MockServerVerifier::rejects_certificate(
+                CertificateError::UnknownIssuer.into(),
+            )))
+            .with_no_client_auth()
+            .unwrap();
 
     let mut client =
         UnbufferedClientConnection::new(Arc::new(client_config), server_name("localhost")).unwrap();
@@ -916,11 +906,11 @@ fn tls13_packed_handshake() {
     let (_hello, _) = encode_tls_data(client.process_tls_records(&mut []));
     confirm_transmit_tls_data(client.process_tls_records(&mut []));
 
-    let mut first_flight = include_bytes!("data/bug2040-message-1.bin").to_vec();
+    let mut first_flight = include_bytes!("../data/bug2040-message-1.bin").to_vec();
     let (_ccs, discard) = encode_tls_data(client.process_tls_records(&mut first_flight[..]));
     assert_eq!(discard, first_flight.len());
 
-    let mut second_flight = include_bytes!("data/bug2040-message-2.bin").to_vec();
+    let mut second_flight = include_bytes!("../data/bug2040-message-2.bin").to_vec();
     let UnbufferedStatus { state, .. } = client.process_tls_records(&mut second_flight[..]);
     assert_eq!(
         state.unwrap_err(),
@@ -932,7 +922,7 @@ fn tls13_packed_handshake() {
 fn rejects_junk() {
     let mut server = UnbufferedServerConnection::new(Arc::new(make_server_config(
         KeyType::Rsa2048,
-        &provider::default_provider(),
+        &provider::DEFAULT_PROVIDER,
     )))
     .unwrap();
 
@@ -963,7 +953,7 @@ fn rejects_junk() {
 
 #[test]
 fn read_traffic_not_consumed_too_early() {
-    let mut outcome = handshake(provider::default_provider().with_only_tls13());
+    let mut outcome = handshake(provider::DEFAULT_TLS13_PROVIDER);
     let mut client = outcome.client.take().unwrap();
     let mut server = outcome.server.take().unwrap();
 
@@ -1224,8 +1214,8 @@ fn advance_server(
     state
 }
 
-fn handle_state<Data>(
-    state: ConnectionState<'_, '_, Data>,
+fn handle_state<Side: SideData>(
+    state: ConnectionState<'_, '_, Side>,
     outgoing: &mut Buffer,
     actions: Actions,
 ) -> State {
@@ -1322,7 +1312,7 @@ fn handle_state<Data>(
     }
 }
 
-fn queue_close_notify<Data>(state: &mut WriteTraffic<'_, Data>, outgoing: &mut Buffer) {
+fn queue_close_notify<Side: SideData>(state: &mut WriteTraffic<'_, Side>, outgoing: &mut Buffer) {
     write_with_buffer_size_checks(
         |out_buf| state.queue_close_notify(out_buf),
         map_encrypt_error,
@@ -1330,7 +1320,11 @@ fn queue_close_notify<Data>(state: &mut WriteTraffic<'_, Data>, outgoing: &mut B
     );
 }
 
-fn encrypt<Data>(state: &mut WriteTraffic<'_, Data>, app_data: &[u8], outgoing: &mut Buffer) {
+fn encrypt<Side: SideData>(
+    state: &mut WriteTraffic<'_, Side>,
+    app_data: &[u8],
+    outgoing: &mut Buffer,
+) {
     write_with_buffer_size_checks(
         |out_buf| state.encrypt(app_data, out_buf),
         map_encrypt_error,
@@ -1454,8 +1448,7 @@ fn make_connection_pair(
 
 #[test]
 fn server_receives_handshake_byte_by_byte() {
-    let (mut client, mut server) =
-        make_connection_pair(provider::default_provider().with_only_tls13());
+    let (mut client, mut server) = make_connection_pair(provider::DEFAULT_TLS13_PROVIDER);
 
     let mut client_hello_buffer = vec![0u8; 2048];
     let UnbufferedStatus { discard, state, .. } = client.process_tls_records(&mut []);
@@ -1489,7 +1482,7 @@ fn server_receives_handshake_byte_by_byte() {
 
 #[test]
 fn server_receives_incorrect_first_handshake_message() {
-    let (_, mut server) = make_connection_pair(provider::default_provider().with_only_tls13());
+    let (_, mut server) = make_connection_pair(provider::DEFAULT_TLS13_PROVIDER);
 
     let mut junk_buffer = [0x16, 0x3, 0x1, 0x0, 0x4, 0xff, 0x0, 0x0, 0x0];
     let junk_buffer_len = junk_buffer.len();
@@ -1528,7 +1521,7 @@ fn test_secret_extraction_enabled() {
     // We support 3 different AEAD algorithms (AES-128-GCM mode, AES-256-GCM, and
     // Chacha20Poly1305), so that's 2*3 = 6 combinations to test.
     let kt = KeyType::Rsa2048;
-    let provider = provider::default_provider();
+    let provider = provider::DEFAULT_PROVIDER;
     for suite in [
         SupportedCipherSuite::Tls13(cipher_suite::TLS13_AES_128_GCM_SHA256),
         SupportedCipherSuite::Tls13(cipher_suite::TLS13_AES_256_GCM_SHA384),
@@ -1543,9 +1536,9 @@ fn test_secret_extraction_enabled() {
 
         // Only offer the cipher suite (and protocol version) that we're testing
         let mut server_config =
-            ServerConfig::builder_with_provider(provider_with_one_suite(&provider, suite).into())
+            ServerConfig::builder(provider_with_one_suite(&provider, suite).into())
                 .with_no_client_auth()
-                .with_single_cert(kt.get_chain(), kt.get_key())
+                .with_single_cert(kt.identity(), kt.key())
                 .unwrap();
         // Opt into secret extraction from both sides
         server_config.enable_secret_extraction = true;
@@ -1610,7 +1603,7 @@ fn test_secret_extraction_enabled() {
 
 #[test]
 fn kernel_err_on_secret_extraction_not_enabled() {
-    let provider = provider::default_provider();
+    let provider = provider::DEFAULT_PROVIDER;
     let server_config = make_server_config(KeyType::Rsa2048, &provider);
     let server_config = Arc::new(server_config);
 
@@ -1637,7 +1630,7 @@ fn kernel_err_on_secret_extraction_not_enabled() {
 
 #[test]
 fn kernel_err_on_handshake_not_complete() {
-    let provider = provider::default_provider();
+    let provider = provider::DEFAULT_PROVIDER;
     let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
     server_config.enable_secret_extraction = true;
     let server_config = Arc::new(server_config);
@@ -1662,7 +1655,7 @@ fn kernel_err_on_handshake_not_complete() {
 
 #[test]
 fn kernel_initial_traffic_secrets_match() {
-    let provider = provider::default_provider();
+    let provider = provider::DEFAULT_PROVIDER;
     let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
     server_config.enable_secret_extraction = true;
     let server_config = Arc::new(server_config);
@@ -1690,7 +1683,7 @@ fn kernel_initial_traffic_secrets_match() {
 
 #[test]
 fn kernel_key_updates_tls13() {
-    let provider = provider::default_provider().with_only_tls13();
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
     let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
     server_config.enable_secret_extraction = true;
     let server_config = Arc::new(server_config);
@@ -1726,7 +1719,7 @@ fn kernel_key_updates_tls13() {
 fn kernel_key_updates_tls12() {
     let _ = env_logger::try_init();
 
-    let provider = provider::default_provider().with_only_tls12();
+    let provider = provider::DEFAULT_TLS12_PROVIDER;
     let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
     server_config.enable_secret_extraction = true;
     let server_config = Arc::new(server_config);

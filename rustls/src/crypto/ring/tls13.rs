@@ -1,18 +1,17 @@
 use alloc::boxed::Box;
 
-use super::ring_like::hkdf::KeyType;
-use super::ring_like::{aead, hkdf, hmac};
+use ring::hkdf::{self, KeyType};
+use ring::{aead, hmac};
+
 use crate::crypto;
 use crate::crypto::cipher::{
-    AeadKey, InboundOpaqueMessage, Iv, MessageDecrypter, MessageEncrypter, Nonce,
-    Tls13AeadAlgorithm, UnsupportedOperationError, make_tls13_aad,
+    AeadKey, InboundOpaqueMessage, InboundPlainMessage, Iv, MessageDecrypter, MessageEncrypter,
+    Nonce, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload, Tls13AeadAlgorithm,
+    UnsupportedOperationError, make_tls13_aad,
 };
 use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError};
 use crate::enums::{CipherSuite, ContentType, ProtocolVersion};
 use crate::error::Error;
-use crate::msgs::message::{
-    InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload,
-};
 use crate::suites::{CipherSuiteCommon, ConnectionTrafficSecrets};
 use crate::tls13::Tls13CipherSuite;
 use crate::version::TLS13_VERSION;
@@ -206,7 +205,7 @@ impl MessageEncrypter for Tls13MessageEncrypter {
         let total_len = self.encrypted_payload_len(msg.payload.len());
         let mut payload = PrefixedPayload::with_capacity(total_len);
 
-        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
+        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).to_array()?);
         let aad = aead::Aad::from(make_tls13_aad(total_len));
         payload.extend_from_chunks(&msg.payload);
         payload.extend_from_slice(&msg.typ.to_array());
@@ -215,13 +214,13 @@ impl MessageEncrypter for Tls13MessageEncrypter {
             .seal_in_place_append_tag(nonce, aad, &mut payload)
             .map_err(|_| Error::EncryptError)?;
 
-        Ok(OutboundOpaqueMessage::new(
-            ContentType::ApplicationData,
+        Ok(OutboundOpaqueMessage {
+            typ: ContentType::ApplicationData,
             // Note: all TLS 1.3 application data records use TLSv1_2 (0x0303) as the legacy record
             // protocol version, see https://www.rfc-editor.org/rfc/rfc8446#section-5.1
-            ProtocolVersion::TLSv1_2,
+            version: ProtocolVersion::TLSv1_2,
             payload,
-        ))
+        })
     }
 
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
@@ -240,7 +239,7 @@ impl MessageDecrypter for Tls13MessageDecrypter {
             return Err(Error::DecryptError);
         }
 
-        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
+        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).to_array()?);
         let aad = aead::Aad::from(make_tls13_aad(payload.len()));
         let plain_len = self
             .dec_key

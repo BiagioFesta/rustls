@@ -4,8 +4,8 @@ use alloc::vec::Vec;
 use zeroize::Zeroize;
 
 use super::{ActiveKeyExchange, hmac};
+use crate::enums::ProtocolVersion;
 use crate::error::Error;
-use crate::version::TLS13;
 
 /// Implementation of `HkdfExpander` via `hmac::Key`.
 pub struct HkdfExpanderUsingHmac(Box<dyn hmac::Key>);
@@ -49,7 +49,7 @@ impl HkdfExpander for HkdfExpanderUsingHmac {
 }
 
 /// Implementation of `Hkdf` (and thence `HkdfExpander`) via `hmac::Hmac`.
-#[allow(clippy::exhaustive_structs)]
+#[expect(clippy::exhaustive_structs)]
 pub struct HkdfUsingHmac<'a>(pub &'a dyn hmac::Hmac);
 
 impl Hkdf for HkdfUsingHmac<'_> {
@@ -160,7 +160,7 @@ pub trait Hkdf: Send + Sync {
     ) -> Result<Box<dyn HkdfExpander>, Error> {
         Ok(self.extract_from_secret(
             salt,
-            kx.complete_for_tls_version(peer_pub_key, &TLS13)?
+            kx.complete_for_tls_version(peer_pub_key, ProtocolVersion::TLSv1_3)?
                 .secret_bytes(),
         ))
     }
@@ -260,7 +260,7 @@ impl AsRef<[u8]> for OkmBlock {
 
 /// An error type used for `HkdfExpander::expand_slice` when
 /// the slice exceeds the maximum HKDF output length.
-#[allow(clippy::exhaustive_structs)]
+#[expect(clippy::exhaustive_structs)]
 #[derive(Debug)]
 pub struct OutputLengthError;
 
@@ -370,7 +370,7 @@ mod tests {
 
         let hkdf = HkdfUsingHmac(&hmac::HMAC_SHA384);
         let ikm = &[0x0b; 40];
-        let info = &[&b"hel"[..], &b"lo"[..]];
+        let info = &[&b"hell"[..], &b"o"[..]];
 
         let output: ByteArray<96> = expand(
             hkdf.extract_from_secret(None, ikm)

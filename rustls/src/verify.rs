@@ -1,9 +1,10 @@
 use alloc::vec::Vec;
 use core::fmt::Debug;
 
-use pki_types::{CertificateDer, ServerName, UnixTime};
+use pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
 
-use crate::enums::SignatureScheme;
+use crate::crypto::Identity;
+use crate::enums::{CertificateType, SignatureScheme};
 use crate::error::{Error, InvalidMessage};
 use crate::msgs::base::PayloadU16;
 use crate::msgs::codec::{Codec, Reader};
@@ -22,8 +23,7 @@ use crate::sync::Arc;
 
 /// Something that can verify a server certificate chain, and verify
 /// signatures made by certificates.
-#[allow(unreachable_pub)]
-pub trait ServerCertVerifier: Debug + Send + Sync {
+pub trait ServerVerifier: Debug + Send + Sync {
     /// Verify the server's identity.
     ///
     /// Note that none of the certificates have been parsed yet, so it is the responsibility of
@@ -32,10 +32,7 @@ pub trait ServerCertVerifier: Debug + Send + Sync {
     ///
     /// [Certificate]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.4.2
     /// [`CertificateError::BadEncoding`]: crate::error::CertificateError::BadEncoding
-    fn verify_server_cert(
-        &self,
-        identity: &ServerIdentity<'_>,
-    ) -> Result<ServerCertVerified, Error>;
+    fn verify_identity(&self, identity: &ServerIdentity<'_>) -> Result<PeerVerified, Error>;
 
     /// Verify a signature allegedly by the given server certificate.
     ///
@@ -80,10 +77,14 @@ pub trait ServerCertVerifier: Debug + Send + Sync {
     /// There is no guarantee the server will provide one.
     fn request_ocsp_response(&self) -> bool;
 
-    /// Returns whether this verifier requires raw public keys as defined
-    /// in [RFC 7250](https://tools.ietf.org/html/rfc7250).
-    fn requires_raw_public_keys(&self) -> bool {
-        false
+    /// Returns which [`CertificateType`]s this verifier supports.
+    ///
+    /// Returning an empty slice will result in an error. The default implementation signals
+    /// support for X.509 certificates. Implementations should return the same value every time.
+    ///
+    /// See [RFC 7250](https://tools.ietf.org/html/rfc7250) for more information.
+    fn supported_certificate_types(&self) -> &'static [CertificateType] {
+        &[CertificateType::X509]
     }
 
     /// Return the [`DistinguishedName`]s of certificate authorities that this verifier trusts.
@@ -98,16 +99,11 @@ pub trait ServerCertVerifier: Debug + Send + Sync {
 }
 
 /// Data required to verify a server's identity.
-#[allow(unreachable_pub)]
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct ServerIdentity<'a> {
-    /// Certificate for the server being verified.
-    pub end_entity: &'a CertificateDer<'a>,
-    /// All certificates other than `end_entity` received in the server's `Certificate` message.
-    ///
-    /// It is in the same order that the server sent them and may be empty.
-    pub intermediates: &'a [CertificateDer<'a>],
+    /// Identity information presented by the server.
+    pub identity: &'a Identity<'a>,
     /// The server name the client specified when connecting to the server.
     pub server_name: &'a ServerName<'a>,
     /// OCSP response stapled to the server's `Certificate` message, if any.
@@ -120,64 +116,15 @@ pub struct ServerIdentity<'a> {
 }
 
 /// Something that can verify a client certificate chain
-#[allow(unreachable_pub)]
-pub trait ClientCertVerifier: Debug + Send + Sync {
-    /// Returns `true` to enable the server to request a client certificate and
-    /// `false` to skip requesting a client certificate. Defaults to `true`.
-    fn offer_client_auth(&self) -> bool {
-        true
-    }
-
-    /// Return `true` to require a client certificate and `false` to make
-    /// client authentication optional.
-    /// Defaults to `self.offer_client_auth()`.
-    fn client_auth_mandatory(&self) -> bool {
-        self.offer_client_auth()
-    }
-
-    /// Returns the [`DistinguishedName`] [subjects] that the server will hint to clients to
-    /// identify acceptable authentication trust anchors.
-    ///
-    /// These hint values help the client pick a client certificate it believes the server will
-    /// accept. The hints must be DER-encoded X.500 distinguished names, per [RFC 5280 A.1]. They
-    /// are sent in the [`certificate_authorities`] extension of a [`CertificateRequest`] message
-    /// when [ClientCertVerifier::offer_client_auth] is true. When an empty list is sent the client
-    /// should always provide a client certificate if it has one.
-    ///
-    /// Generally this list should contain the [`DistinguishedName`] of each root trust
-    /// anchor in the root cert store that the server is configured to use for authenticating
-    /// presented client certificates.
-    ///
-    /// In some circumstances this list may be customized to include [`DistinguishedName`] entries
-    /// that do not correspond to a trust anchor in the server's root cert store. For example,
-    /// the server may be configured to trust a root CA that cross-signed an issuer certificate
-    /// that the client considers a trust anchor. From the server's perspective the cross-signed
-    /// certificate is an intermediate, and not present in the server's root cert store. The client
-    /// may have the cross-signed certificate configured as a trust anchor, and be unaware of the
-    /// root CA that cross-signed it. If the server's hints list only contained the subjects of the
-    /// server's root store the client would consider a client certificate issued by the cross-signed
-    /// issuer unacceptable, since its subject was not hinted. To avoid this circumstance the server
-    /// should customize the hints list to include the subject of the cross-signed issuer in addition
-    /// to the subjects from the root cert store.
-    ///
-    /// [subjects]: https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.2.6
-    /// [RFC 5280 A.1]: https://www.rfc-editor.org/rfc/rfc5280#appendix-A.1
-    /// [`CertificateRequest`]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.3.2
-    /// [`certificate_authorities`]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.4
-    fn root_hint_subjects(&self) -> Arc<[DistinguishedName]>;
-
+pub trait ClientVerifier: Debug + Send + Sync {
     /// Verify the client's identity.
     ///
     /// Note that none of the certificates have been parsed yet, so it is the responsibility of
     /// the implementer to handle invalid data. It is recommended that the implementer returns
-    /// an [InvalidCertificate] error with the [BadEncoding] variant when these cases are encountered.
+    /// a [`CertificateError::BadEncoding`] error when these cases are encountered.
     ///
-    /// [InvalidCertificate]: Error#variant.InvalidCertificate
-    /// [BadEncoding]: crate::CertificateError#variant.BadEncoding
-    fn verify_client_cert(
-        &self,
-        identity: &ClientIdentity<'_>,
-    ) -> Result<ClientCertVerified, Error>;
+    /// [`CertificateError::BadEncoding`]: crate::error::CertificateError::BadEncoding
+    fn verify_identity(&self, identity: &ClientIdentity<'_>) -> Result<PeerVerified, Error>;
 
     /// Verify a signature allegedly by the given client certificate.
     ///
@@ -207,36 +154,78 @@ pub trait ClientCertVerifier: Debug + Send + Sync {
         input: &SignatureVerificationInput<'_>,
     ) -> Result<HandshakeSignatureValid, Error>;
 
+    /// Returns the [`DistinguishedName`] [subjects] that the server will hint to clients to
+    /// identify acceptable authentication trust anchors.
+    ///
+    /// These hint values help the client pick a client certificate it believes the server will
+    /// accept. The hints must be DER-encoded X.500 distinguished names, per [RFC 5280 A.1]. They
+    /// are sent in the [`certificate_authorities`] extension of a [`CertificateRequest`] message
+    /// when [ClientVerifier::offer_client_auth] is true. When an empty list is sent the client
+    /// should always provide a client certificate if it has one.
+    ///
+    /// Generally this list should contain the [`DistinguishedName`] of each root trust
+    /// anchor in the root cert store that the server is configured to use for authenticating
+    /// presented client certificates.
+    ///
+    /// In some circumstances this list may be customized to include [`DistinguishedName`] entries
+    /// that do not correspond to a trust anchor in the server's root cert store. For example,
+    /// the server may be configured to trust a root CA that cross-signed an issuer certificate
+    /// that the client considers a trust anchor. From the server's perspective the cross-signed
+    /// certificate is an intermediate, and not present in the server's root cert store. The client
+    /// may have the cross-signed certificate configured as a trust anchor, and be unaware of the
+    /// root CA that cross-signed it. If the server's hints list only contained the subjects of the
+    /// server's root store the client would consider a client certificate issued by the cross-signed
+    /// issuer unacceptable, since its subject was not hinted. To avoid this circumstance the server
+    /// should customize the hints list to include the subject of the cross-signed issuer in addition
+    /// to the subjects from the root cert store.
+    ///
+    /// [subjects]: https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.2.6
+    /// [RFC 5280 A.1]: https://www.rfc-editor.org/rfc/rfc5280#appendix-A.1
+    /// [`CertificateRequest`]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.3.2
+    /// [`certificate_authorities`]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.4
+    fn root_hint_subjects(&self) -> Arc<[DistinguishedName]>;
+
+    /// Return `true` to require a client certificate and `false` to make
+    /// client authentication optional.
+    /// Defaults to `self.offer_client_auth()`.
+    fn client_auth_mandatory(&self) -> bool {
+        self.offer_client_auth()
+    }
+
+    /// Returns `true` to enable the server to request a client certificate and
+    /// `false` to skip requesting a client certificate. Defaults to `true`.
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
     /// Return the list of SignatureSchemes that this verifier will handle,
     /// in `verify_tls12_signature` and `verify_tls13_signature` calls.
     ///
     /// This should be in priority order, with the most preferred first.
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme>;
 
-    /// Returns whether this verifier requires raw public keys as defined
-    /// in [RFC 7250](https://tools.ietf.org/html/rfc7250).
-    fn requires_raw_public_keys(&self) -> bool {
-        false
+    /// Returns which [`CertificateType`]s this verifier supports.
+    ///
+    /// Returning an empty slice will result in an error. The default implementation signals
+    /// support for X.509 certificates. Implementations should return the same value every time.
+    ///
+    /// See [RFC 7250](https://tools.ietf.org/html/rfc7250) for more information.
+    fn supported_certificate_types(&self) -> &'static [CertificateType] {
+        &[CertificateType::X509]
     }
 }
 
 /// Data required to verify a client's identity.
-#[allow(unreachable_pub)]
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct ClientIdentity<'a> {
-    /// Certificate for the client being verified.
-    pub end_entity: &'a CertificateDer<'a>,
-    /// All certificates other than `end_entity` received in the client's `Certificate` message.
-    ///
-    /// It is in the same order that the server sent them and may be empty.
-    pub intermediates: &'a [CertificateDer<'a>],
+    /// Identity information presented by the client.
+    pub identity: &'a Identity<'a>,
     /// Current time against which time-sensitive inputs should be validated.
     pub now: UnixTime,
 }
 
 /// Input for message signature verification.
-#[allow(unreachable_pub)]
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct SignatureVerificationInput<'a> {
@@ -245,34 +234,35 @@ pub struct SignatureVerificationInput<'a> {
     /// The public key to use.
     ///
     /// `signer` has already been validated by the point this is called.
-    pub signer: &'a CertificateDer<'a>,
+    pub signer: &'a SignerPublicKey<'a>,
     /// The signature scheme and payload.
     pub signature: &'a DigitallySignedStruct,
+}
+
+/// Public key used to verify a signature.
+///
+/// Used as part of [`SignatureVerificationInput`].
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum SignerPublicKey<'a> {
+    /// An X.509 certificate for the signing peer.
+    X509(&'a CertificateDer<'a>),
+    /// A raw public key, as defined in [RFC 7250](https://tools.ietf.org/html/rfc7250).
+    RawPublicKey(&'a SubjectPublicKeyInfoDer<'a>),
 }
 
 /// Turns off client authentication.
 ///
 /// In contrast to using
 /// `WebPkiClientVerifier::builder(roots).allow_unauthenticated().build()`, the `NoClientAuth`
-/// `ClientCertVerifier` will not offer client authentication at all, vs offering but not
+/// `ClientVerifier` will not offer client authentication at all, vs offering but not
 /// requiring it.
-#[allow(clippy::exhaustive_structs)]
+#[expect(clippy::exhaustive_structs)]
 #[derive(Debug)]
 pub struct NoClientAuth;
 
-impl ClientCertVerifier for NoClientAuth {
-    fn offer_client_auth(&self) -> bool {
-        false
-    }
-
-    fn root_hint_subjects(&self) -> Arc<[DistinguishedName]> {
-        unimplemented!();
-    }
-
-    fn verify_client_cert(
-        &self,
-        _identity: &ClientIdentity<'_>,
-    ) -> Result<ClientCertVerified, Error> {
+impl ClientVerifier for NoClientAuth {
+    fn verify_identity(&self, _identity: &ClientIdentity<'_>) -> Result<PeerVerified, Error> {
         unimplemented!();
     }
 
@@ -288,6 +278,14 @@ impl ClientCertVerifier for NoClientAuth {
         _input: &SignatureVerificationInput<'_>,
     ) -> Result<HandshakeSignatureValid, Error> {
         unimplemented!();
+    }
+
+    fn root_hint_subjects(&self) -> Arc<[DistinguishedName]> {
+        unimplemented!();
+    }
+
+    fn offer_client_auth(&self) -> bool {
+        false
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -351,25 +349,12 @@ impl FinishedMessageVerified {
     }
 }
 
-/// Zero-sized marker type representing verification of a server cert chain.
-#[allow(unreachable_pub)]
+/// Zero-sized marker type representing verification of the peer's identity.
 #[derive(Debug)]
-pub struct ServerCertVerified(());
+pub struct PeerVerified(());
 
-#[allow(unreachable_pub)]
-impl ServerCertVerified {
-    /// Make a `ServerCertVerified`
-    pub fn assertion() -> Self {
-        Self(())
-    }
-}
-
-/// Zero-sized marker type representing verification of a client cert chain.
-#[derive(Debug)]
-pub struct ClientCertVerified(());
-
-impl ClientCertVerified {
-    /// Make a `ClientCertVerified`
+impl PeerVerified {
+    /// Make a `PeerVerified`
     pub fn assertion() -> Self {
         Self(())
     }
@@ -380,8 +365,8 @@ fn assertions_are_debug() {
     use std::format;
 
     assert_eq!(
-        format!("{:?}", ClientCertVerified::assertion()),
-        "ClientCertVerified(())"
+        format!("{:?}", PeerVerified::assertion()),
+        "PeerVerified(())"
     );
     assert_eq!(
         format!("{:?}", HandshakeSignatureValid::assertion()),
@@ -390,9 +375,5 @@ fn assertions_are_debug() {
     assert_eq!(
         format!("{:?}", FinishedMessageVerified::assertion()),
         "FinishedMessageVerified(())"
-    );
-    assert_eq!(
-        format!("{:?}", ServerCertVerified::assertion()),
-        "ServerCertVerified(())"
     );
 }

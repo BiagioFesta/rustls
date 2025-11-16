@@ -1,14 +1,14 @@
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-use pki_types::{CertificateDer, PrivateKeyDer};
+use pki_types::PrivateKeyDer;
 
 use super::client_conn::Resumption;
 use crate::builder::{ConfigBuilder, WantsVerifier};
-use crate::client::{ClientConfig, EchMode, ResolvesClientCert, handy};
-use crate::error::Error;
+use crate::client::{ClientConfig, ClientCredentialResolver, EchMode, handy};
+use crate::crypto::{Credentials, Identity, SingleCredential};
+use crate::error::{ApiMisuse, Error};
 use crate::key_log::NoKeyLog;
-use crate::sign::{CertifiedKey, SingleCertAndKey};
 use crate::sync::Arc;
 use crate::webpki::{self, WebPkiServerVerifier};
 use crate::{compress, verify};
@@ -39,7 +39,7 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
     /// ```diff
     /// - .with_root_certificates(root_store)
     /// + .with_webpki_verifier(
-    /// +   WebPkiServerVerifier::builder_with_provider(root_store, crypto_provider)
+    /// +   WebPkiServerVerifier::builder(root_store, crypto_provider)
     /// +   .with_crls(...)
     /// +   .build()?
     /// + )
@@ -59,7 +59,7 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
     /// Choose how to verify server certificates using a webpki verifier.
     ///
     /// See [`webpki::WebPkiServerVerifier::builder`] and
-    /// [`webpki::WebPkiServerVerifier::builder_with_provider`] for more information.
+    /// [`webpki::WebPkiServerVerifier::builder`] for more information.
     pub fn with_webpki_verifier(
         self,
         verifier: Arc<WebPkiServerVerifier>,
@@ -101,7 +101,7 @@ pub(super) mod danger {
         /// Set a custom certificate verifier.
         pub fn with_custom_certificate_verifier(
             self,
-            verifier: Arc<dyn verify::ServerCertVerifier>,
+            verifier: Arc<dyn verify::ServerVerifier>,
         ) -> ConfigBuilder<ClientConfig, WantsClientCert> {
             ConfigBuilder {
                 state: WantsClientCert {
@@ -122,7 +122,7 @@ pub(super) mod danger {
 /// For more information, see the [`ConfigBuilder`] documentation.
 #[derive(Clone)]
 pub struct WantsClientCert {
-    verifier: Arc<dyn verify::ServerCertVerifier>,
+    verifier: Arc<dyn verify::ServerVerifier>,
     client_ech_mode: Option<EchMode>,
 }
 
@@ -138,22 +138,22 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
     /// This function fails if `key_der` is invalid.
     pub fn with_client_auth_cert(
         self,
-        cert_chain: Vec<CertificateDer<'static>>,
+        identity: Arc<Identity<'static>>,
         key_der: PrivateKeyDer<'static>,
     ) -> Result<ClientConfig, Error> {
-        let certified_key = CertifiedKey::from_der(cert_chain, key_der, &self.provider)?;
-        self.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key)))
+        let credentials = Credentials::from_der(identity, key_der, &self.provider)?;
+        self.with_client_credential_resolver(Arc::new(SingleCredential::from(credentials)))
     }
 
     /// Do not support client auth.
     pub fn with_no_client_auth(self) -> Result<ClientConfig, Error> {
-        self.with_client_cert_resolver(Arc::new(handy::FailResolveClientCert {}))
+        self.with_client_credential_resolver(Arc::new(handy::FailResolveClientCert {}))
     }
 
-    /// Sets a custom [`ResolvesClientCert`].
-    pub fn with_client_cert_resolver(
+    /// Sets a custom [`ClientCredentialResolver`].
+    pub fn with_client_credential_resolver(
         self,
-        client_auth_cert_resolver: Arc<dyn ResolvesClientCert>,
+        client_auth_cert_resolver: Arc<dyn ClientCredentialResolver>,
     ) -> Result<ClientConfig, Error> {
         self.provider.consistency_check()?;
 
@@ -166,8 +166,8 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
                     .tls13_cipher_suites
                     .is_empty(),
             ) {
-                (_, true) => return Err(Error::General("ECH requires TLS1.3 support".into())),
-                (false, _) => return Err(Error::General("ECH forbids TLS1.2 support".into())),
+                (_, true) => return Err(ApiMisuse::EchRequiresTls13Support.into()),
+                (false, _) => return Err(ApiMisuse::EchForbidsTls12Support.into()),
                 (true, false) => {}
             };
         }

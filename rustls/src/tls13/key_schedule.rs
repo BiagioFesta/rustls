@@ -1,7 +1,6 @@
 //! Key schedule maintenance for TLS1.3
 
 use alloc::boxed::Box;
-use alloc::string::ToString;
 use core::ops::Deref;
 
 use crate::common_state::{CommonState, Side};
@@ -9,7 +8,7 @@ use crate::conn::Exporter;
 use crate::crypto::cipher::{AeadKey, Iv, MessageDecrypter, Tls13AeadAlgorithm};
 use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError, expand};
 use crate::crypto::{SharedSecret, hash, hmac};
-use crate::error::Error;
+use crate::error::{ApiMisuse, Error};
 use crate::msgs::message::Message;
 use crate::suites::PartiallyExtractedSecrets;
 use crate::{ConnectionTrafficSecrets, KeyLog, Tls13CipherSuite, quic};
@@ -331,7 +330,7 @@ impl KeyScheduleHandshake {
 
         let before_finished =
             KeyScheduleBeforeFinished::new(self.ks, hs_hash, key_log, client_random);
-        let (_client_secret, server_secret) = (
+        let (client_secret, server_secret) = (
             &before_finished.current_client_traffic_secret,
             &before_finished.current_server_traffic_secret,
         );
@@ -342,7 +341,7 @@ impl KeyScheduleHandshake {
 
         if common.is_quic() {
             common.quic.traffic_secrets = Some(quic::Secrets::new(
-                _client_secret.clone(),
+                client_secret.clone(),
                 server_secret.clone(),
                 before_finished.ks.suite,
                 before_finished.ks.suite.quic.unwrap(),
@@ -590,6 +589,7 @@ impl KeyScheduleTraffic {
             &secret,
             self.ks.suite.hkdf_provider,
             self.ks.suite.aead_alg.key_len(),
+            self.ks.suite.aead_alg.iv_len(),
         );
         Ok(self
             .ks
@@ -603,11 +603,13 @@ impl KeyScheduleTraffic {
             &self.current_client_traffic_secret,
             self.ks.suite.hkdf_provider,
             self.ks.suite.aead_alg.key_len(),
+            self.ks.suite.aead_alg.iv_len(),
         );
         let (server_key, server_iv) = expand_secret(
             &self.current_server_traffic_secret,
             self.ks.suite.hkdf_provider,
             self.ks.suite.aead_alg.key_len(),
+            self.ks.suite.aead_alg.iv_len(),
         );
         let client_secrets = self
             .ks
@@ -652,12 +654,17 @@ impl KeyScheduleResumption {
     }
 }
 
-fn expand_secret(secret: &OkmBlock, hkdf: &'static dyn Hkdf, aead_key_len: usize) -> (AeadKey, Iv) {
+fn expand_secret(
+    secret: &OkmBlock,
+    hkdf: &'static dyn Hkdf,
+    aead_key_len: usize,
+    iv_len: usize,
+) -> (AeadKey, Iv) {
     let expander = hkdf.expander_for_okm(secret);
 
     (
         hkdf_expand_label_aead_key(expander.as_ref(), aead_key_len, b"key", &[]),
-        hkdf_expand_label(expander.as_ref(), b"iv", &[]),
+        derive_traffic_iv(expander.as_ref(), iv_len),
     )
 }
 
@@ -785,7 +792,7 @@ impl KeyScheduleSuite {
             .hkdf_provider
             .expander_for_okm(secret);
         let key = derive_traffic_key(expander.as_ref(), self.suite.aead_alg);
-        let iv = derive_traffic_iv(expander.as_ref());
+        let iv = derive_traffic_iv(expander.as_ref(), self.suite.aead_alg.iv_len());
 
         common
             .record_layer
@@ -807,7 +814,7 @@ impl KeyScheduleSuite {
             .hkdf_provider
             .expander_for_okm(secret);
         let key = derive_traffic_key(expander.as_ref(), self.suite.aead_alg);
-        let iv = derive_traffic_iv(expander.as_ref());
+        let iv = derive_traffic_iv(expander.as_ref(), self.suite.aead_alg.iv_len());
         self.suite.aead_alg.decrypter(key, iv)
     }
 
@@ -888,7 +895,7 @@ impl KeyScheduleSuite {
             .hkdf_provider
             .expander_for_okm(&secret);
         hkdf_expand_label_slice(expander.as_ref(), b"exporter", h_context.as_ref(), out)
-            .map_err(|_| Error::General("exporting too much".to_string()))
+            .map_err(|_| ApiMisuse::ExporterOutputTooLong.into())
     }
 }
 
@@ -901,18 +908,18 @@ impl From<&'static Tls13CipherSuite> for KeyScheduleSuite {
 /// [HKDF-Expand-Label] where the output is an AEAD key.
 ///
 /// [HKDF-Expand-Label]: <https://www.rfc-editor.org/rfc/rfc8446#section-7.1>
-pub fn derive_traffic_key(
+pub(crate) fn derive_traffic_key(
     expander: &dyn HkdfExpander,
     aead_alg: &dyn Tls13AeadAlgorithm,
 ) -> AeadKey {
     hkdf_expand_label_aead_key(expander, aead_alg.key_len(), b"key", &[])
 }
 
-/// [HKDF-Expand-Label] where the output is an IV.
+/// [HKDF-Expand-Label] where the output is an IV with a specified length.
 ///
 /// [HKDF-Expand-Label]: <https://www.rfc-editor.org/rfc/rfc8446#section-7.1>
-pub fn derive_traffic_iv(expander: &dyn HkdfExpander) -> Iv {
-    hkdf_expand_label(expander, b"iv", &[])
+pub(crate) fn derive_traffic_iv(expander: &dyn HkdfExpander, iv_len: usize) -> Iv {
+    hkdf_expand_label_iv(expander, b"iv", &[], iv_len)
 }
 
 /// [HKDF-Expand-Label] where the output length is a compile-time constant, and therefore
@@ -948,6 +955,21 @@ pub(crate) fn hkdf_expand_label_aead_key(
     hkdf_expand_label_inner(expander, label, context, key_len, |e, info| {
         let key: AeadKey = expand(e, info);
         key.with_length(key_len)
+    })
+}
+
+/// [HKDF-Expand-Label] where the output is an IV.
+pub(crate) fn hkdf_expand_label_iv(
+    expander: &dyn HkdfExpander,
+    label: &[u8],
+    context: &[u8],
+    iv_len: usize,
+) -> Iv {
+    hkdf_expand_label_inner(expander, label, context, iv_len, |e, info| {
+        let mut buf = [0u8; Iv::MAX_LEN];
+        e.expand_slice(info, &mut buf[..iv_len])
+            .unwrap();
+        Iv::new(&buf[..iv_len]).expect("IV length from cipher suite must be within MAX_LEN")
     })
 }
 
@@ -1072,50 +1094,48 @@ impl SecretKind {
 }
 
 #[cfg(test)]
-#[macro_rules_attribute::apply(test_for_each_provider)]
 mod tests {
     use core::fmt::Debug;
     use std::prelude::v1::*;
-    use std::vec;
 
-    use super::provider::ring_like::aead;
-    use super::provider::tls13::{
-        TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
-    };
     use super::{KeySchedule, SecretKind, derive_traffic_iv, derive_traffic_key};
-    use crate::KeyLog;
-    use crate::msgs::enums::HashAlgorithm;
+    use crate::TEST_PROVIDERS;
+    use crate::crypto::{CryptoProvider, tls13_suite};
+    use crate::enums::{CipherSuite, HashAlgorithm};
+    use crate::key_log::KeyLog;
 
     #[test]
     fn empty_hash() {
-        let sha256 = TLS13_AES_128_GCM_SHA256
-            .common
-            .hash_provider;
-        let sha384 = TLS13_AES_256_GCM_SHA384
-            .common
-            .hash_provider;
+        for provider in TEST_PROVIDERS {
+            let sha256 = tls13_suite(CipherSuite::TLS13_AES_128_GCM_SHA256, provider)
+                .common
+                .hash_provider;
+            let sha384 = tls13_suite(CipherSuite::TLS13_AES_256_GCM_SHA384, provider)
+                .common
+                .hash_provider;
 
-        assert!(
-            sha256.start().finish().as_ref()
-                == HashAlgorithm::SHA256
-                    .hash_for_empty_input()
-                    .unwrap()
-                    .as_ref()
-        );
-        assert!(
-            sha384.start().finish().as_ref()
-                == HashAlgorithm::SHA384
-                    .hash_for_empty_input()
-                    .unwrap()
-                    .as_ref()
-        );
+            assert!(
+                sha256.start().finish().as_ref()
+                    == HashAlgorithm::SHA256
+                        .hash_for_empty_input()
+                        .unwrap()
+                        .as_ref()
+            );
+            assert!(
+                sha384.start().finish().as_ref()
+                    == HashAlgorithm::SHA384
+                        .hash_for_empty_input()
+                        .unwrap()
+                        .as_ref()
+            );
 
-        // a theoretical example of unsupported hash
-        assert!(
-            HashAlgorithm::SHA1
-                .hash_for_empty_input()
-                .is_none()
-        );
+            // a theoretical example of unsupported hash
+            assert!(
+                HashAlgorithm::SHA1
+                    .hash_for_empty_input()
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -1199,46 +1219,57 @@ mod tests {
             0x0d, 0xb2, 0x8f, 0x98, 0x85, 0x86, 0xa1, 0xb7, 0xe4, 0xd5, 0xc6, 0x9c,
         ];
 
-        let mut ks = KeySchedule::new_with_empty_secret(TLS13_CHACHA20_POLY1305_SHA256);
-        ks.input_secret(&ecdhe_secret);
+        for provider in TEST_PROVIDERS {
+            #[cfg(not(feature = "fips"))]
+            let aead = tls13_suite(CipherSuite::TLS13_CHACHA20_POLY1305_SHA256, provider);
+            #[cfg(feature = "fips")]
+            let aead = tls13_suite(CipherSuite::TLS13_AES_128_GCM_SHA256, provider);
 
-        assert_traffic_secret(
-            &ks,
-            SecretKind::ClientHandshakeTrafficSecret,
-            &hs_start_hash,
-            &client_hts,
-            &client_hts_key,
-            &client_hts_iv,
-        );
+            let mut ks = KeySchedule::new_with_empty_secret(aead);
+            ks.input_secret(&ecdhe_secret);
 
-        assert_traffic_secret(
-            &ks,
-            SecretKind::ServerHandshakeTrafficSecret,
-            &hs_start_hash,
-            &server_hts,
-            &server_hts_key,
-            &server_hts_iv,
-        );
+            assert_traffic_secret(
+                &ks,
+                SecretKind::ClientHandshakeTrafficSecret,
+                &hs_start_hash,
+                &client_hts,
+                &client_hts_key,
+                &client_hts_iv,
+                provider,
+            );
 
-        ks.input_empty();
+            assert_traffic_secret(
+                &ks,
+                SecretKind::ServerHandshakeTrafficSecret,
+                &hs_start_hash,
+                &server_hts,
+                &server_hts_key,
+                &server_hts_iv,
+                provider,
+            );
 
-        assert_traffic_secret(
-            &ks,
-            SecretKind::ClientApplicationTrafficSecret,
-            &hs_full_hash,
-            &client_ats,
-            &client_ats_key,
-            &client_ats_iv,
-        );
+            ks.input_empty();
 
-        assert_traffic_secret(
-            &ks,
-            SecretKind::ServerApplicationTrafficSecret,
-            &hs_full_hash,
-            &server_ats,
-            &server_ats_key,
-            &server_ats_iv,
-        );
+            assert_traffic_secret(
+                &ks,
+                SecretKind::ClientApplicationTrafficSecret,
+                &hs_full_hash,
+                &client_ats,
+                &client_ats_key,
+                &client_ats_iv,
+                provider,
+            );
+
+            assert_traffic_secret(
+                &ks,
+                SecretKind::ServerApplicationTrafficSecret,
+                &hs_full_hash,
+                &server_ats,
+                &server_ats_key,
+                &server_ats_iv,
+                provider,
+            );
+        }
     }
 
     fn assert_traffic_secret(
@@ -1248,44 +1279,30 @@ mod tests {
         expected_traffic_secret: &[u8],
         expected_key: &[u8],
         expected_iv: &[u8],
+        provider: &CryptoProvider,
     ) {
-        #[derive(Debug)]
-        struct Log<'a>(&'a [u8]);
-        impl KeyLog for Log<'_> {
-            fn log(&self, _label: &str, _client_random: &[u8], secret: &[u8]) {
-                assert_eq!(self.0, secret);
-            }
-        }
         let log = Log(expected_traffic_secret);
         let traffic_secret = ks.derive_logged_secret(kind, hash, &log, &[0; 32]);
 
         // Since we can't test key equality, we test the output of sealing with the key instead.
-        let aead_alg = &aead::AES_128_GCM;
-        let expander = TLS13_AES_128_GCM_SHA256
+        let aes_128_gcm = tls13_suite(CipherSuite::TLS13_AES_128_GCM_SHA256, provider);
+        let expander = aes_128_gcm
             .hkdf_provider
             .expander_for_okm(&traffic_secret);
-        let key = derive_traffic_key(expander.as_ref(), TLS13_AES_128_GCM_SHA256.aead_alg);
-        let key = aead::UnboundKey::new(aead_alg, key.as_ref()).unwrap();
-        let seal_output = seal_zeroes(key);
-        let expected_key = aead::UnboundKey::new(aead_alg, expected_key).unwrap();
-        let expected_seal_output = seal_zeroes(expected_key);
-        assert_eq!(seal_output, expected_seal_output);
-        assert!(seal_output.len() >= 48); // Sanity check.
 
-        let iv = derive_traffic_iv(expander.as_ref());
-        assert_eq!(iv.as_ref(), expected_iv);
+        let actual_key = derive_traffic_key(expander.as_ref(), aes_128_gcm.aead_alg);
+        assert_eq!(actual_key.as_ref(), expected_key);
+        let actual_iv = derive_traffic_iv(expander.as_ref(), aes_128_gcm.aead_alg.iv_len());
+        assert_eq!(actual_iv.as_ref(), expected_iv);
     }
 
-    fn seal_zeroes(key: aead::UnboundKey) -> Vec<u8> {
-        let key = aead::LessSafeKey::new(key);
-        let mut seal_output = vec![0; 32];
-        key.seal_in_place_append_tag(
-            aead::Nonce::assume_unique_for_key([0; aead::NONCE_LEN]),
-            aead::Aad::empty(),
-            &mut seal_output,
-        )
-        .unwrap();
-        seal_output
+    #[derive(Debug)]
+    struct Log<'a>(&'a [u8]);
+
+    impl KeyLog for Log<'_> {
+        fn log(&self, _label: &str, _client_random: &[u8], secret: &[u8]) {
+            assert_eq!(self.0, secret);
+        }
     }
 }
 
@@ -1317,7 +1334,12 @@ mod benchmarks {
                 traffic_secret_expander.as_ref(),
                 TLS13_CHACHA20_POLY1305_SHA256.aead_alg,
             ));
-            test::black_box(derive_traffic_iv(traffic_secret_expander.as_ref()));
+            test::black_box(derive_traffic_iv(
+                traffic_secret_expander.as_ref(),
+                TLS13_CHACHA20_POLY1305_SHA256
+                    .aead_alg
+                    .iv_len(),
+            ));
         }
 
         b.iter(|| {

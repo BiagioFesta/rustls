@@ -25,7 +25,7 @@
 //! to a wider set of architectures and environments, or compliance requirements.  See the
 //! [`crypto::CryptoProvider`] documentation for more details.
 //!
-//! Rustls requires Rust 1.79 or later.
+//! Rustls requires Rust 1.83 or later.
 //!
 //! [ring-target-platforms]: https://github.com/briansmith/ring/blob/2e8363b433fa3b3962c877d9ed2e9145612f3160/include/ring-core/target.h#L18-L64
 //! [`crypto::CryptoProvider`]: crate::crypto::CryptoProvider
@@ -39,9 +39,8 @@
 //! that Rustls uses. This may be appealing if you have specific platform, compliance or feature
 //! requirements.
 //!
-//! Users that wish to customize the provider in use can do so when constructing `ClientConfig`
-//! and `ServerConfig` instances using the `with_crypto_provider` method on the respective config
-//! builder types. See the [`crypto::CryptoProvider`] documentation for more details.
+//! From 0.24, users must explicitly provide a crypto provider when constructing `ClientConfig` or
+//! `ServerConfig` instances. See the [`crypto::CryptoProvider`] documentation for more details.
 //!
 //! #### Built-in providers
 //!
@@ -161,8 +160,9 @@
 //!
 //! ```rust,no_run
 //! # #[cfg(feature = "aws-lc-rs")] {
+//! # use std::sync::Arc;
 //! # let root_store: rustls::RootCertStore = panic!();
-//! let config = rustls::ClientConfig::builder()
+//! let config = rustls::ClientConfig::builder(Arc::new(rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER))
 //!     .with_root_certificates(root_store)
 //!     .with_no_client_auth()
 //!     .unwrap();
@@ -177,13 +177,13 @@
 //! # use rustls;
 //! # use webpki;
 //! # use std::sync::Arc;
-//! # rustls::crypto::aws_lc_rs::default_provider().install_default();
+//! # use rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER;
 //! # let root_store = rustls::RootCertStore::from_iter(
 //! #  webpki_roots::TLS_SERVER_ROOTS
 //! #      .iter()
 //! #      .cloned(),
 //! # );
-//! # let config = rustls::ClientConfig::builder()
+//! # let config = rustls::ClientConfig::builder(Arc::new(DEFAULT_PROVIDER))
 //! #     .with_root_certificates(root_store)
 //! #     .with_no_client_auth()
 //! #     .unwrap();
@@ -325,37 +325,27 @@
     clippy::exhaustive_enums,
     clippy::exhaustive_structs,
     clippy::manual_let_else,
+    clippy::or_fun_call,
     clippy::std_instead_of_core,
     clippy::use_self,
     clippy::upper_case_acronyms,
     elided_lifetimes_in_paths,
     missing_docs,
-    trivial_casts,
     trivial_numeric_casts,
+    unnameable_types,
     unreachable_pub,
     unused_import_braces,
     unused_extern_crates,
     unused_qualifications
 )]
 // Relax these clippy lints:
-// - ptr_arg: this triggers on references to type aliases that are Vec
-//   underneath.
 // - too_many_arguments: some things just need a lot of state, wrapping it
 //   doesn't necessarily make it easier to follow what's going on
-// - new_ret_no_self: we sometimes return `Arc<Self>`, which seems fine
-// - single_component_path_imports: our top-level `use log` import causes
-//   a false positive, https://github.com/rust-lang/rust-clippy/issues/5210
 // - new_without_default: for internal constructors, the indirection is not
 //   helpful
-#![allow(
-    clippy::too_many_arguments,
-    clippy::new_ret_no_self,
-    clippy::ptr_arg,
-    clippy::single_component_path_imports,
-    clippy::new_without_default
-)]
+#![expect(clippy::too_many_arguments, clippy::new_without_default)]
 // Enable documentation for all features on docs.rs
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(rustls_docsrs, feature(doc_cfg))]
 // Enable coverage() attr for nightly coverage builds, see
 // <https://github.com/rust-lang/rust/issues/84605>
 // (`coverage_nightly` is a cfg set by `cargo-llvm-cov`)
@@ -377,20 +367,22 @@ use crate::crypto::CryptoProvider;
 
 // Import `test` sysroot crate for `Bencher` definitions.
 #[cfg(bench)]
-#[allow(unused_extern_crates)]
+#[expect(unused_extern_crates)]
 extern crate test;
 
 // log for logging (optional).
 #[cfg(feature = "log")]
+#[expect(clippy::single_component_path_imports)]
 use log;
 
 #[cfg(not(feature = "log"))]
 mod log {
-    macro_rules! trace    ( ($($tt:tt)*) => {{}} );
-    macro_rules! debug    ( ($($tt:tt)*) => {{}} );
-    macro_rules! error    ( ($($tt:tt)*) => {{}} );
-    macro_rules! _warn    ( ($($tt:tt)*) => {{}} );
-    pub(crate) use {_warn as warn, debug, error, trace};
+    macro_rules! trace    ( ($($tt:tt)*) => { crate::log::_used!($($tt)*) } );
+    macro_rules! debug    ( ($($tt:tt)*) => { crate::log::_used!($($tt)*) } );
+    macro_rules! error    ( ($($tt:tt)*) => { crate::log::_used!($($tt)*) } );
+    macro_rules! _warn    ( ($($tt:tt)*) => { crate::log::_used!($($tt)*) } );
+    macro_rules! _used    ( ($($tt:tt)*) => { { let _ = format_args!($($tt)*); } } );
+    pub(crate) use {_used, _warn as warn, debug, error, trace};
 }
 
 #[cfg(test)]
@@ -401,12 +393,13 @@ mod test_macros;
 /// of rustls targeting architectures without atomic pointers to replace the implementation
 /// with another implementation such as `portable_atomic_util::Arc` in one central location.
 mod sync {
-    #[allow(clippy::disallowed_types)]
+    #[expect(clippy::disallowed_types)]
     pub(crate) type Arc<T> = alloc::sync::Arc<T>;
-    #[allow(clippy::disallowed_types)]
+    #[expect(clippy::disallowed_types)]
     pub(crate) type Weak<T> = alloc::sync::Weak<T>;
 }
 
+#[expect(unnameable_types)]
 #[macro_use]
 mod msgs;
 mod common_state;
@@ -414,7 +407,7 @@ pub mod compress;
 mod conn;
 /// Crypto provider interface.
 pub mod crypto;
-mod error;
+pub mod error;
 mod hash_hs;
 #[cfg(any(feature = "std", feature = "hashbrown"))]
 mod limited_cache;
@@ -431,10 +424,9 @@ mod verifybench;
 mod x509;
 #[macro_use]
 mod check;
-#[cfg(feature = "log")]
 mod bs_debug;
 mod builder;
-mod enums;
+pub mod enums;
 mod key_log;
 #[cfg(feature = "std")]
 mod key_log_file;
@@ -444,14 +436,10 @@ mod webpki;
 
 /// Internal classes that are used in integration tests.
 /// The contents of this section DO NOT form part of the stable interface.
-#[allow(missing_docs)]
 #[doc(hidden)]
 pub mod internal {
     /// Low-level TLS message parsing and encoding functions.
     pub mod msgs {
-        pub mod base {
-            pub use crate::msgs::base::{Payload, PayloadU16};
-        }
         pub mod codec {
             pub use crate::msgs::codec::{Codec, Reader};
         }
@@ -462,16 +450,12 @@ pub mod internal {
             pub use crate::msgs::fragmenter::MessageFragmenter;
         }
         pub mod message {
-            pub use crate::msgs::message::{
-                Message, MessagePayload, OutboundOpaqueMessage, PlainMessage,
-            };
+            pub use crate::msgs::message::{Message, MessagePayload};
         }
         pub mod persist {
             pub use crate::msgs::persist::ServerSessionValue;
         }
     }
-
-    pub use crate::tls13::key_schedule::{derive_traffic_iv, derive_traffic_key};
 
     pub mod fuzzing {
         pub use crate::msgs::deframer::fuzz_deframer;
@@ -519,15 +503,7 @@ pub use crate::common_state::{CommonState, HandshakeKind, IoState, Side};
 #[cfg(feature = "std")]
 pub use crate::conn::{Connection, Reader, Writer};
 pub use crate::conn::{ConnectionCommon, KeyingMaterialExporter, SideData, kernel};
-pub use crate::enums::{
-    AlertDescription, CertificateCompressionAlgorithm, CipherSuite, ContentType, HandshakeType,
-    ProtocolVersion, SignatureAlgorithm, SignatureScheme,
-};
-pub use crate::error::{
-    CertRevocationListError, CertificateError, EncryptedClientHelloError, Error,
-    ExtendedKeyPurpose, InconsistentKeys, InvalidMessage, OtherError, PeerIncompatible,
-    PeerMisbehaved, RejectedEch,
-};
+pub use crate::error::Error;
 pub use crate::key_log::{KeyLog, NoKeyLog};
 #[cfg(feature = "std")]
 pub use crate::key_log_file::KeyLogFile;
@@ -543,7 +519,7 @@ pub use crate::suites::{
 pub use crate::ticketer::TicketRotator;
 pub use crate::tls12::Tls12CipherSuite;
 pub use crate::tls13::Tls13CipherSuite;
-pub use crate::verify::DigitallySignedStruct;
+pub use crate::verify::{DigitallySignedStruct, SignerPublicKey};
 pub use crate::versions::{ALL_VERSIONS, DEFAULT_VERSIONS, SupportedProtocolVersion};
 pub use crate::webpki::RootCertStore;
 
@@ -562,13 +538,13 @@ pub mod client {
 
     pub use builder::WantsClientCert;
     pub use client_conn::{
-        ClientConfig, ClientConnectionData, ClientSessionStore, EarlyDataError, ResolvesClientCert,
-        Resumption, Tls12Resumption, UnbufferedClientConnection,
+        ClientConfig, ClientConnectionData, ClientCredentialResolver, ClientSessionStore,
+        CredentialRequest, EarlyDataError, MayEncryptEarlyData, Resumption, Tls12Resumption,
+        UnbufferedClientConnection,
     };
     #[cfg(feature = "std")]
     pub use client_conn::{ClientConnection, WriteEarlyData};
     pub use ech::{EchConfig, EchGreaseConfig, EchMode, EchStatus};
-    pub use handy::AlwaysResolvesClientRawPublicKeys;
     #[cfg(any(feature = "std", feature = "hashbrown"))]
     pub use handy::ClientSessionMemoryCache;
 
@@ -577,18 +553,19 @@ pub mod client {
         pub use super::builder::danger::DangerousClientConfigBuilder;
         pub use super::client_conn::danger::DangerousClientConfig;
         pub use crate::verify::{
-            HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier, ServerIdentity,
+            HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
             SignatureVerificationInput,
         };
     }
 
-    pub(crate) use tls12::{TLS12_HANDLER, Tls12Handler};
-    pub(crate) use tls13::{TLS13_HANDLER, Tls13Handler};
+    pub(crate) use hs::ClientHandler;
+    pub(crate) use tls12::TLS12_HANDLER;
+    pub(crate) use tls13::TLS13_HANDLER;
 
     pub use crate::msgs::persist::{Tls12ClientSessionValue, Tls13ClientSessionValue};
     pub use crate::webpki::{
-        ServerCertVerifierBuilder, VerifierBuilderError, WebPkiServerVerifier,
-        verify_server_cert_signed_by_trust_anchor, verify_server_name,
+        ServerVerifierBuilder, VerifierBuilderError, WebPkiServerVerifier,
+        verify_identity_signed_by_trust_anchor, verify_server_name,
     };
 }
 
@@ -599,7 +576,6 @@ pub use client::ClientConnection;
 /// Items for use in a server.
 pub mod server {
     pub(crate) mod builder;
-    mod common;
     pub(crate) mod handy;
     mod hs;
     mod server_conn;
@@ -609,33 +585,33 @@ pub mod server {
     mod tls13;
 
     pub use builder::WantsServerCert;
+    pub use handy::NoServerSessionStorage;
     #[cfg(any(feature = "std", feature = "hashbrown"))]
-    pub use handy::ResolvesServerCertUsingSni;
+    pub use handy::ServerNameResolver;
     #[cfg(any(feature = "std", feature = "hashbrown"))]
     pub use handy::ServerSessionMemoryCache;
-    pub use handy::{AlwaysResolvesServerRawPublicKeys, NoServerSessionStorage};
-    pub use server_conn::{
-        Accepted, ClientHello, ProducesTickets, ResolvesServerCert, ServerConfig,
-        ServerConnectionData, StoresServerSessions, UnbufferedServerConnection,
-    };
     #[cfg(feature = "std")]
-    pub use server_conn::{AcceptedAlert, Acceptor, ReadEarlyData, ServerConnection};
+    pub use server_conn::{Accepted, AcceptedAlert, Acceptor, ReadEarlyData, ServerConnection};
+    pub use server_conn::{
+        ClientHello, InvalidSniPolicy, ServerConfig, ServerConnectionData,
+        ServerCredentialResolver, StoresServerSessions, UnbufferedServerConnection,
+    };
 
-    pub use crate::enums::CertificateType;
     pub use crate::verify::NoClientAuth;
     pub use crate::webpki::{
-        ClientCertVerifierBuilder, ParsedCertificate, VerifierBuilderError, WebPkiClientVerifier,
+        ClientVerifierBuilder, ParsedCertificate, VerifierBuilderError, WebPkiClientVerifier,
     };
 
     /// Dangerous configuration that should be audited and used with extreme care.
     pub mod danger {
         pub use crate::verify::{
-            ClientCertVerified, ClientCertVerifier, ClientIdentity, SignatureVerificationInput,
+            ClientIdentity, ClientVerifier, PeerVerified, SignatureVerificationInput,
         };
     }
 
-    pub(crate) use tls12::{TLS12_HANDLER, Tls12Handler};
-    pub(crate) use tls13::{TLS13_HANDLER, Tls13Handler};
+    pub(crate) use hs::ServerHandler;
+    pub(crate) use tls12::TLS12_HANDLER;
+    pub(crate) use tls13::TLS13_HANDLER;
 }
 
 pub use server::ServerConfig;
@@ -657,16 +633,11 @@ pub mod pki_types {
     pub use pki_types::*;
 }
 
-/// Message signing interfaces.
-pub mod sign {
-    pub use crate::crypto::signer::{CertifiedKey, Signer, SigningKey, SingleCertAndKey};
-}
-
 /// APIs for implementing QUIC TLS
 pub mod quic;
 
 /// APIs for implementing TLS tickets
-#[cfg(any(feature = "std", feature = "hashbrown"))] // < XXX: incorrect feature gate
+#[cfg(feature = "std")]
 pub mod ticketer;
 
 /// This is the rustls manual.
@@ -676,9 +647,6 @@ pub mod time_provider;
 
 /// APIs abstracting over locking primitives.
 pub mod lock;
-
-/// Polyfills for features that are not yet stabilized or available with current MSRV.
-pub(crate) mod polyfill;
 
 #[cfg(any(feature = "std", feature = "hashbrown"))]
 mod hash_map {
@@ -694,5 +662,14 @@ mod hash_map {
 }
 
 mod sealed {
+    #[expect(unnameable_types)]
     pub trait Sealed {}
 }
+
+#[cfg(test)]
+const TEST_PROVIDERS: &[&crypto::CryptoProvider] = &[
+    #[cfg(feature = "aws-lc-rs")]
+    &crypto::aws_lc_rs::DEFAULT_PROVIDER,
+    #[cfg(feature = "ring")]
+    &crypto::ring::DEFAULT_PROVIDER,
+];

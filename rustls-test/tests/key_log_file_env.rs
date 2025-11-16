@@ -3,17 +3,14 @@
 use std::env;
 use std::sync::Mutex;
 
-#[macro_use]
-mod macros;
-
 #[cfg(feature = "ring")]
 #[path = "."]
 mod tests_with_ring {
     use super::serialized;
 
-    provider_ring!();
+    rustls_test::provider_ring!();
 
-    #[path = "../key_log_file_env.rs"]
+    #[path = "key_log_file_env/tests.rs"]
     mod tests;
 }
 
@@ -22,9 +19,9 @@ mod tests_with_ring {
 mod tests_with_aws_lc_rs {
     use super::serialized;
 
-    provider_aws_lc_rs!();
+    rustls_test::provider_aws_lc_rs!();
 
-    #[path = "../key_log_file_env.rs"]
+    #[path = "key_log_file_env/tests.rs"]
     mod tests;
 }
 
